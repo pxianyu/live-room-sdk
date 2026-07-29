@@ -1,0 +1,37 @@
+{
+  "name": "@company/live-room-sdk",
+  "version": "0.1.0",
+  "description": "Live room browser SDK for viewer and operator sessions.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "examples"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/unit/**/*.test.mjs"
+  },
+  "keywords": [
+    "live-room",
+    "sdk",
+    "goeasy"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "goeasy": "2.14.8"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.15",
+    "typescript": "5.9.2"
+  }
+}
