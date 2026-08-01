@@ -40,6 +40,7 @@ export interface RoomSnapshot {
     id: string;
     title: string | undefined;
     status: string | undefined;
+    likeCount: number | undefined;
     muted: boolean | undefined;
     notice: string | undefined;
     features: Record<string, boolean> | undefined;
@@ -71,7 +72,7 @@ export interface MessagePage {
     nextCursor: string | undefined;
     hasMore: boolean;
 }
-export type RoomEventName = 'state.changed' | 'room.status.changed' | 'online.changed' | 'message.created' | 'message.deleted' | 'user.muted' | 'room.muted' | 'notice.updated' | 'error';
+export type RoomEventName = 'state.changed' | 'room.status.changed' | 'online.changed' | 'message.created' | 'message.deleted' | 'like.changed' | 'user.muted' | 'room.muted' | 'notice.updated' | 'error';
 export interface RoomStateChangedEvent {
     previous: RoomConnectionState;
     current: RoomConnectionState;
@@ -89,10 +90,14 @@ export interface MessageDeletedEvent {
     messageId: string;
     reason: string | undefined;
 }
+export interface LikeChangedEvent {
+    count: number | undefined;
+    total: number | null;
+    userId: string | undefined;
+}
 export interface UserMutedEvent {
     userId: string;
-    durationSeconds: number | undefined;
-    expiresAt: string | undefined;
+    muted: boolean;
     reason: string | undefined;
 }
 export interface RoomMutedEvent {
@@ -110,6 +115,7 @@ export interface LiveRoomEventMap {
     'online.changed': OnlineChangedEvent;
     'message.created': MessageCreatedEvent;
     'message.deleted': MessageDeletedEvent;
+    'like.changed': LikeChangedEvent;
     'user.muted': UserMutedEvent;
     'room.muted': RoomMutedEvent;
     'notice.updated': NoticeUpdatedEvent;
@@ -129,7 +135,7 @@ export interface LiveRoom {
     sendComment(text: string): Promise<PendingMessage>;
     sendLike(count?: number): Promise<void>;
     deleteComment(messageId: string, reason?: string): Promise<void>;
-    muteUser(userId: string, durationSeconds?: number): Promise<void>;
+    muteUser(userId: string): Promise<void>;
     unmuteUser(userId: string): Promise<void>;
     setRoomMute(enabled: boolean): Promise<void>;
     on<T extends RoomEventName>(event: T, handler: RoomEventHandler<T>): () => void;
@@ -143,6 +149,7 @@ export interface LiveRoomSdk {
     close(): Promise<void>;
 }
 export interface ApiEnvelope<T> {
+    status?: number;
     data: T;
     request_id: string | undefined;
     error?: {
@@ -171,6 +178,7 @@ export interface BootstrapResponse {
         id: string;
         title?: string;
         status?: string;
+        like_count?: number;
         muted?: boolean;
         notice?: string;
         sequence?: number;

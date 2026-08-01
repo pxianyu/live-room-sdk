@@ -76,6 +76,16 @@ export async function connectGoEasy(runtime, credential, onEvent, logger) {
         });
     }
     catch (error) {
+        await new Promise((resolve) => {
+            if (typeof instance.disconnect !== 'function') {
+                resolve();
+                return;
+            }
+            instance.disconnect({
+                onSuccess: resolve,
+                onFailed: () => resolve()
+            });
+        });
         throw wrapGoEasyError('GOEASY_SUBSCRIBE_FAILED', error);
     }
     return {

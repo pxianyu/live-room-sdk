@@ -25,6 +25,7 @@ export declare class ViewerWebSocketTransport {
     private heartbeatTimer;
     private reconnectTimer;
     private detachSocketListeners;
+    private cancelOpen;
     constructor(runtime: LiveRoomRuntime, getCredential: () => Promise<ViewerWebSocketCredential>, callbacks: ViewerWebSocketCallbacks, room: RoomSnapshot, logger?: LiveRoomLogger | undefined);
     open(): Promise<void>;
     close(): Promise<void>;

@@ -2,6 +2,8 @@ import { LiveRoomSdkError } from '../errors.js';
 import type { LiveRoomLogger, RoomSnapshot } from '../types.js';
 import type { LiveRoomRuntime, WebSocketLike } from './runtime.js';
 
+const READY_TIMEOUT_MS = 10_000;
+
 export interface ViewerWebSocketCredential {
   url: string;
   ticket: string;
@@ -32,6 +34,7 @@ export class ViewerWebSocketTransport {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private detachSocketListeners: (() => void) | null = null;
+  private cancelOpen: ((error: Error) => void) | null = null;
 
   constructor(
     private readonly runtime: LiveRoomRuntime,
@@ -65,6 +68,11 @@ export class ViewerWebSocketTransport {
     this.stopHeartbeat();
     this.clearReconnectTimer();
     this.socketGeneration += 1;
+    this.cancelOpen?.(new LiveRoomSdkError({
+      code: 'SDK_CLOSED',
+      message: 'The SDK has already been closed.'
+    }));
+    this.cancelOpen = null;
     this.detachSocketListeners?.();
     this.detachSocketListeners = null;
 
@@ -75,20 +83,38 @@ export class ViewerWebSocketTransport {
 
   private async connectNextSocket(): Promise<void> {
     const credential = await this.getCredential();
+    if (this.closed) {
+      throw new LiveRoomSdkError({
+        code: 'SDK_CLOSED',
+        message: 'The SDK has already been closed.'
+      });
+    }
     const generation = ++this.socketGeneration;
     const socket = this.runtime.createWebSocket(credential.url);
     this.socket = socket;
 
     await new Promise<void>((resolve, reject) => {
       let resolved = false;
+      let readyTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const clearReadyTimer = () => {
+        if (readyTimer) {
+          this.runtime.clearTimeout(readyTimer);
+          readyTimer = null;
+        }
+      };
 
       const cleanup = () => {
+        clearReadyTimer();
         socket.removeEventListener('open', handleOpen as EventListener);
         socket.removeEventListener('message', handleMessage as EventListener);
         socket.removeEventListener('close', handleClose as EventListener);
         socket.removeEventListener('error', handleError as EventListener);
         if (this.detachSocketListeners === cleanup) {
           this.detachSocketListeners = null;
+        }
+        if (this.cancelOpen === fail) {
+          this.cancelOpen = null;
         }
       };
       this.detachSocketListeners?.();
@@ -103,11 +129,14 @@ export class ViewerWebSocketTransport {
         reject(error);
       };
 
+      this.cancelOpen = fail;
+
       const succeed = () => {
         if (resolved) {
           return;
         }
         resolved = true;
+        clearReadyTimer();
         this.reconnectAttempts = 0;
         resolve();
       };
@@ -206,6 +235,7 @@ export class ViewerWebSocketTransport {
             retryable: true
           })
         );
+        socket.close(4000, 'error');
       };
 
       const handleClose = (event: CloseEventLike) => {
@@ -229,7 +259,8 @@ export class ViewerWebSocketTransport {
           return;
         }
 
-        if (!this.closed) {
+        const roomEnded = ['STOPPED', 'ENDED'].includes((this.room.status ?? '').toUpperCase());
+        if (!this.closed && !roomEnded) {
           this.callbacks.onReconnecting();
           this.scheduleReconnect();
         }
@@ -239,6 +270,14 @@ export class ViewerWebSocketTransport {
       socket.addEventListener('message', handleMessage as EventListener);
       socket.addEventListener('close', handleClose as EventListener);
       socket.addEventListener('error', handleError as EventListener);
+      readyTimer = this.runtime.setTimeout(() => {
+        fail(new LiveRoomSdkError({
+          code: 'WEBSOCKET_AUTH_FAILED',
+          message: 'Room websocket did not become ready in time.',
+          retryable: true
+        }));
+        socket.close(4000, 'ready_timeout');
+      }, READY_TIMEOUT_MS);
     }).catch((error) => {
       this.connectPromise = null;
       if (!this.closed) {

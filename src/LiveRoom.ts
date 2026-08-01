@@ -1,4 +1,3 @@
-import { LiveRoomSdkError } from './errors.js';
 import { TypedEventEmitter } from './internal/emitter.js';
 import { RoomEventReducer, type ReducerEmission } from './internal/event-reducer.js';
 import type {
@@ -25,7 +24,7 @@ export interface RoomDelegate {
   sendComment(text: string): Promise<PendingMessage>;
   sendLike(count?: number): Promise<void>;
   deleteComment(messageId: string, reason?: string): Promise<void>;
-  muteUser(userId: string, durationSeconds?: number): Promise<void>;
+  muteUser(userId: string): Promise<void>;
   unmuteUser(userId: string): Promise<void>;
   setRoomMute(enabled: boolean): Promise<void>;
 }
@@ -87,8 +86,8 @@ export class LiveRoomState implements LiveRoom {
     return this.delegate.deleteComment(messageId, reason);
   }
 
-  muteUser(userId: string, durationSeconds?: number): Promise<void> {
-    return this.delegate.muteUser(userId, durationSeconds);
+  muteUser(userId: string): Promise<void> {
+    return this.delegate.muteUser(userId);
   }
 
   unmuteUser(userId: string): Promise<void> {
@@ -140,6 +139,9 @@ export class LiveRoomState implements LiveRoom {
     }
 
     this.snapshot.status = status;
+    if (['STOPPED', 'ENDED'].includes(status.toUpperCase())) {
+      this.setState('ended');
+    }
     this.emitter.emit('room.status.changed', {
       room: this.snapshot
     });
@@ -161,6 +163,10 @@ export class LiveRoomState implements LiveRoom {
     this.reducer.trackPending(message);
   }
 
+  hydrateHistory(messages: ReadonlyArray<Record<string, unknown>>): RoomMessage[] {
+    return this.reducer.hydrateHistory(messages);
+  }
+
   getLastSequence(): number | null {
     return this.reducer.getLastSequence();
   }
@@ -171,6 +177,12 @@ export class LiveRoomState implements LiveRoom {
 
   private emitReducerEvents(events: ReducerEmission[]): void {
     for (const event of events) {
+      if (event.name === 'room.status.changed') {
+        const status = (event.payload as LiveRoomEventMap['room.status.changed']).room.status ?? '';
+        if (['STOPPED', 'ENDED'].includes(status.toUpperCase())) {
+          this.setState('ended');
+        }
+      }
       this.emitter.emit(event.name, event.payload as never);
     }
   }
@@ -182,14 +194,4 @@ export class LiveRoomState implements LiveRoom {
     return this.snapshot;
   }
 
-  requireCapability(capability: string): void {
-    if (!this.snapshot) {
-      throw new LiveRoomSdkError({
-        code: 'AUTHENTICATION_REQUIRED',
-        message: 'The room is not ready yet.'
-      });
-    }
-
-    void capability;
-  }
 }

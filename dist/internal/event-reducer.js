@@ -63,6 +63,28 @@ export class RoomEventReducer {
     snapshotMessages() {
         return this.messages;
     }
+    /**
+     * REST 历史和 GoEasy 事件使用同一条消息归并路径，避免回放后重复插入。
+     *
+     * @param messages 服务端返回的蛇形字段消息列表
+     */
+    hydrateHistory(messages) {
+        const hydrated = [];
+        for (const item of messages) {
+            const message = normalizeMessage(item, new Date().toISOString());
+            if (message.messageId === '') {
+                continue;
+            }
+            if (message.eventId) {
+                this.appliedEventIds.add(message.eventId);
+            }
+            if (typeof message.sequence === 'number') {
+                this.lastSequence = Math.max(this.lastSequence ?? 0, message.sequence);
+            }
+            hydrated.push(this.mergeMessage(message));
+        }
+        return hydrated;
+    }
     trackPending(message) {
         if (message.clientRequestId) {
             this.pendingByRequestId.set(message.clientRequestId, message);
@@ -112,14 +134,29 @@ export class RoomEventReducer {
                 return this.applyMessageCreated(event, data);
             case 'chat.message.deleted.v1':
                 return this.applyMessageDeleted(data);
+            case 'engagement.like.delta.v1': {
+                const total = typeof data.total === 'number' ? data.total : null;
+                if (room && total !== null) {
+                    room.likeCount = total;
+                }
+                return [
+                    {
+                        name: 'like.changed',
+                        payload: {
+                            count: typeof data.count === 'number' ? data.count : undefined,
+                            total,
+                            userId: typeof data.user_id === 'string' ? data.user_id : undefined
+                        }
+                    }
+                ];
+            }
             case 'chat.user.muted.v1':
                 return [
                     {
                         name: 'user.muted',
                         payload: {
                             userId: String(data.user_id ?? ''),
-                            durationSeconds: typeof data.duration_seconds === 'number' ? data.duration_seconds : undefined,
-                            expiresAt: typeof data.expires_at === 'string' ? data.expires_at : undefined,
+                            muted: Boolean(data.muted),
                             reason: typeof data.reason === 'string' ? data.reason : undefined
                         }
                     }
@@ -174,38 +211,38 @@ export class RoomEventReducer {
             event_id: event.event_id,
             sequence: event.sequence
         }, event.occurred_at ?? new Date().toISOString());
-        const existingById = this.messageIds.get(message.messageId);
-        const pending = message.clientRequestId && this.pendingByRequestId.has(message.clientRequestId)
-            ? this.pendingByRequestId.get(message.clientRequestId)
-            : undefined;
-        const target = pending ?? existingById;
-        if (target) {
-            target.messageId = message.messageId;
-            target.eventId = message.eventId;
-            target.sequence = message.sequence;
-            target.createdAt = message.createdAt;
-            target.author = message.author;
-            target.content = message.content;
-            target.state = 'committed';
-            this.messageIds.set(target.messageId, target);
-            if (target.clientRequestId) {
-                this.pendingByRequestId.delete(target.clientRequestId);
-            }
-            return [
-                {
-                    name: 'message.created',
-                    payload: { message: target }
-                }
-            ];
-        }
-        insertSortedMessage(this.messages, message);
-        this.messageIds.set(message.messageId, message);
+        const target = this.mergeMessage(message);
         return [
             {
                 name: 'message.created',
-                payload: { message }
+                payload: { message: target }
             }
         ];
+    }
+    mergeMessage(message) {
+        const existingById = this.messageIds.get(message.messageId);
+        const pending = message.clientRequestId
+            ? this.pendingByRequestId.get(message.clientRequestId)
+            : undefined;
+        const target = pending ?? existingById;
+        if (!target) {
+            insertSortedMessage(this.messages, message);
+            this.messageIds.set(message.messageId, message);
+            return message;
+        }
+        this.messageIds.delete(target.messageId);
+        target.messageId = message.messageId;
+        target.eventId = message.eventId;
+        target.sequence = message.sequence;
+        target.createdAt = message.createdAt;
+        target.author = message.author;
+        target.content = message.content;
+        target.state = 'committed';
+        this.messageIds.set(target.messageId, target);
+        if (target.clientRequestId) {
+            this.pendingByRequestId.delete(target.clientRequestId);
+        }
+        return target;
     }
     applyMessageDeleted(data) {
         const messageId = String(data.message_id ?? '');

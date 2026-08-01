@@ -1,4 +1,5 @@
 import { LiveRoomSdkError } from '../errors.js';
+const READY_TIMEOUT_MS = 10_000;
 export class ViewerWebSocketTransport {
     runtime;
     getCredential;
@@ -13,6 +14,7 @@ export class ViewerWebSocketTransport {
     heartbeatTimer = null;
     reconnectTimer = null;
     detachSocketListeners = null;
+    cancelOpen = null;
     constructor(runtime, getCredential, callbacks, room, logger) {
         this.runtime = runtime;
         this.getCredential = getCredential;
@@ -39,6 +41,11 @@ export class ViewerWebSocketTransport {
         this.stopHeartbeat();
         this.clearReconnectTimer();
         this.socketGeneration += 1;
+        this.cancelOpen?.(new LiveRoomSdkError({
+            code: 'SDK_CLOSED',
+            message: 'The SDK has already been closed.'
+        }));
+        this.cancelOpen = null;
         this.detachSocketListeners?.();
         this.detachSocketListeners = null;
         const currentSocket = this.socket;
@@ -47,18 +54,35 @@ export class ViewerWebSocketTransport {
     }
     async connectNextSocket() {
         const credential = await this.getCredential();
+        if (this.closed) {
+            throw new LiveRoomSdkError({
+                code: 'SDK_CLOSED',
+                message: 'The SDK has already been closed.'
+            });
+        }
         const generation = ++this.socketGeneration;
         const socket = this.runtime.createWebSocket(credential.url);
         this.socket = socket;
         await new Promise((resolve, reject) => {
             let resolved = false;
+            let readyTimer = null;
+            const clearReadyTimer = () => {
+                if (readyTimer) {
+                    this.runtime.clearTimeout(readyTimer);
+                    readyTimer = null;
+                }
+            };
             const cleanup = () => {
+                clearReadyTimer();
                 socket.removeEventListener('open', handleOpen);
                 socket.removeEventListener('message', handleMessage);
                 socket.removeEventListener('close', handleClose);
                 socket.removeEventListener('error', handleError);
                 if (this.detachSocketListeners === cleanup) {
                     this.detachSocketListeners = null;
+                }
+                if (this.cancelOpen === fail) {
+                    this.cancelOpen = null;
                 }
             };
             this.detachSocketListeners?.();
@@ -71,11 +95,13 @@ export class ViewerWebSocketTransport {
                 cleanup();
                 reject(error);
             };
+            this.cancelOpen = fail;
             const succeed = () => {
                 if (resolved) {
                     return;
                 }
                 resolved = true;
+                clearReadyTimer();
                 this.reconnectAttempts = 0;
                 resolve();
             };
@@ -164,6 +190,7 @@ export class ViewerWebSocketTransport {
                     message: 'Failed to establish the room websocket.',
                     retryable: true
                 }));
+                socket.close(4000, 'error');
             };
             const handleClose = (event) => {
                 if (generation !== this.socketGeneration) {
@@ -181,7 +208,8 @@ export class ViewerWebSocketTransport {
                     }));
                     return;
                 }
-                if (!this.closed) {
+                const roomEnded = ['STOPPED', 'ENDED'].includes((this.room.status ?? '').toUpperCase());
+                if (!this.closed && !roomEnded) {
                     this.callbacks.onReconnecting();
                     this.scheduleReconnect();
                 }
@@ -190,6 +218,14 @@ export class ViewerWebSocketTransport {
             socket.addEventListener('message', handleMessage);
             socket.addEventListener('close', handleClose);
             socket.addEventListener('error', handleError);
+            readyTimer = this.runtime.setTimeout(() => {
+                fail(new LiveRoomSdkError({
+                    code: 'WEBSOCKET_AUTH_FAILED',
+                    message: 'Room websocket did not become ready in time.',
+                    retryable: true
+                }));
+                socket.close(4000, 'ready_timeout');
+            }, READY_TIMEOUT_MS);
         }).catch((error) => {
             this.connectPromise = null;
             if (!this.closed) {

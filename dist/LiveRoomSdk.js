@@ -19,6 +19,7 @@ function normalizeRoomSnapshot(bootstrap) {
             id: bootstrap.room.id,
             title: bootstrap.room.title,
             status: bootstrap.room.status,
+            likeCount: bootstrap.room.like_count,
             muted: bootstrap.room.muted,
             notice: bootstrap.room.notice,
             features: bootstrap.room.features,
@@ -42,8 +43,8 @@ function parseExpiry(value) {
     const millis = Date.parse(value);
     return Number.isNaN(millis) ? undefined : millis;
 }
-function isMessageHistoryUnavailable(error) {
-    return error instanceof LiveRoomSdkError && error.code === 'FEATURE_NOT_AVAILABLE' && error.status === 501;
+function isTerminalRoomStatus(status) {
+    return ['STOPPED', 'ENDED'].includes((status ?? '').toUpperCase());
 }
 export class LiveRoomSdkImpl {
     options;
@@ -53,13 +54,15 @@ export class LiveRoomSdkImpl {
     runtime;
     httpClient;
     authClient;
+    requestAbortController = new AbortController();
     session = null;
-    currentBootstrap = null;
     goeasyConnection = null;
     websocketTransport = null;
     closed = false;
+    sessionCreateFlight = null;
     connectFlight = null;
     refreshFlight = null;
+    sessionRefreshFlight = null;
     closeFlight = null;
     constructor(options, runtimeOptions = {}) {
         this.options = options;
@@ -75,17 +78,25 @@ export class LiveRoomSdkImpl {
             sendComment: (text) => this.sendComment(text),
             sendLike: (count) => this.sendLike(count),
             deleteComment: (messageId, reason) => this.deleteComment(messageId, reason),
-            muteUser: (userId, durationSeconds) => this.muteUser(userId, durationSeconds),
+            muteUser: (userId) => this.muteUser(userId),
             unmuteUser: (userId) => this.unmuteUser(userId),
             setRoomMute: (enabled) => this.setRoomMute(enabled)
         });
+        this.room.on('room.status.changed', ({ room }) => {
+            if (['STOPPED', 'ENDED'].includes((room.status ?? '').toUpperCase())) {
+                // GoEasy 和 WebSocket 都会进入同一状态事件，统一关闭实时资源。
+                void this.disposeRealtime();
+            }
+        });
         this.authClient = new HttpClient({
             baseUrl: options.apiBaseUrl,
-            fetch: this.runtime.fetch
+            fetch: this.runtime.fetch,
+            signal: this.requestAbortController.signal
         });
         this.httpClient = new HttpClient({
             baseUrl: options.apiBaseUrl,
             fetch: this.runtime.fetch,
+            signal: this.requestAbortController.signal,
             onUnauthorized: async () => {
                 await this.refreshSession(true);
                 return this.session?.accessToken ?? null;
@@ -96,6 +107,9 @@ export class LiveRoomSdkImpl {
         if (this.connectFlight) {
             return this.connectFlight;
         }
+        if (this.refreshFlight) {
+            return this.refreshFlight;
+        }
         this.assertOpen();
         this.connectFlight = this.connectInternal().finally(() => {
             this.connectFlight = null;
@@ -105,6 +119,9 @@ export class LiveRoomSdkImpl {
     async refresh() {
         if (this.refreshFlight) {
             return this.refreshFlight;
+        }
+        if (this.connectFlight) {
+            return this.connectFlight;
         }
         this.assertOpen();
         this.refreshFlight = this.refreshInternal().finally(() => {
@@ -122,45 +139,119 @@ export class LiveRoomSdkImpl {
         return this.closeFlight;
     }
     async connectInternal() {
-        this.room.setState('authenticating');
-        await this.ensureSession();
-        this.room.setState('bootstrapping');
-        const bootstrap = await this.fetchBootstrap();
-        this.applyBootstrap(bootstrap, true);
-        this.room.setState('connecting');
         try {
-            await this.startRealtime();
+            this.room.setState('authenticating');
+            await this.ensureSession();
+            this.assertOpen();
+            this.room.setState('bootstrapping');
+            const bootstrap = await this.fetchBootstrap();
+            this.assertOpen();
+            this.applyBootstrap(bootstrap, true);
+            if (isTerminalRoomStatus(this.room.info?.status)) {
+                this.room.setState('ended');
+                return;
+            }
+            this.room.setState('connecting');
+            let realtimeError = null;
+            try {
+                realtimeError = await this.startRealtime();
+            }
+            catch (error) {
+                realtimeError = error;
+            }
+            if (this.room.state === 'ended') {
+                return;
+            }
+            this.assertOpen();
+            this.room.setState('synchronizing');
+            await this.loadInitialMessages();
+            await this.catchUpMessages();
+            this.assertOpen();
+            this.room.drainBufferedEvents();
+            if (isTerminalRoomStatus(this.room.info?.status)) {
+                this.room.setState('ended');
+                return;
+            }
+            if (realtimeError) {
+                this.degradeRealtime(realtimeError);
+                return;
+            }
+            this.room.setState('ready');
         }
         catch (error) {
-            this.degradeRealtime(error);
-            return;
+            if (this.room.state === 'ended') {
+                return;
+            }
+            if (this.closed) {
+                this.assertOpen();
+            }
+            if (!this.closed) {
+                // 同步失败后不能保留已连接的实时通道和心跳。
+                await this.disposeRealtime();
+                this.room.emitError(this.asError(error));
+                this.room.setState('error');
+            }
+            throw error;
         }
-        this.room.setState('synchronizing');
-        await this.catchUpMessages();
-        this.room.drainBufferedEvents();
-        this.room.setState('ready');
     }
     async refreshInternal() {
-        this.room.setState('reconnecting');
-        await this.refreshSession(false);
-        const bootstrap = await this.fetchBootstrap();
-        this.applyBootstrap(bootstrap, false);
         try {
-            await this.restartRealtime();
+            this.room.setState('reconnecting');
+            await this.refreshSession(false);
+            this.assertOpen();
+            const bootstrap = await this.fetchBootstrap();
+            this.assertOpen();
+            this.applyBootstrap(bootstrap, false);
+            if (isTerminalRoomStatus(this.room.info?.status)) {
+                this.room.setState('ended');
+                return;
+            }
+            let realtimeError = null;
+            try {
+                realtimeError = await this.restartRealtime();
+            }
+            catch (error) {
+                realtimeError = error;
+            }
+            if (this.room.state === 'ended') {
+                return;
+            }
+            await this.catchUpMessages();
+            this.assertOpen();
+            this.room.drainBufferedEvents();
+            if (isTerminalRoomStatus(this.room.info?.status)) {
+                this.room.setState('ended');
+                return;
+            }
+            if (realtimeError) {
+                this.degradeRealtime(realtimeError);
+                return;
+            }
+            this.room.setState('ready');
         }
         catch (error) {
-            this.degradeRealtime(error);
-            return;
+            if (this.room.state === 'ended') {
+                return;
+            }
+            if (this.closed) {
+                this.assertOpen();
+            }
+            if (!this.closed) {
+                // 刷新失败时旧通道已被替换，必须同时释放新通道。
+                await this.disposeRealtime();
+                this.room.emitError(this.asError(error));
+                this.room.setState('error');
+            }
+            throw error;
         }
-        await this.catchUpMessages();
-        this.room.drainBufferedEvents();
-        this.room.setState('ready');
     }
     async closeInternal() {
         if (this.closed) {
             return;
         }
         this.closed = true;
+        // 页面销毁时停止未完成的 bootstrap、历史和命令请求。
+        this.requestAbortController.abort();
         this.room.setState('closed');
         await this.disposeRealtime();
         if (this.session) {
@@ -169,23 +260,35 @@ export class LiveRoomSdkImpl {
                 method: 'DELETE',
                 path: '/sdk/v1/sessions/current',
                 accessToken: this.session.accessToken,
+                signal: null,
                 retryOnUnauthorized: false
             })
                 .catch(() => undefined);
         }
         this.session = null;
-        this.currentBootstrap = null;
         this.user.clear();
     }
     async ensureSession() {
         if (this.session && !isExpired(this.session.expiresAt, this.runtime.now())) {
             return this.session;
         }
-        const next = await this.createSession();
-        this.session = next;
-        return next;
+        if (!this.sessionCreateFlight) {
+            // 一次性 viewer ticket 只能交换一次，所有首个请求必须复用同一个会话创建。
+            this.sessionCreateFlight = this.createSession()
+                .then((next) => {
+                this.session = next;
+                return next;
+            })
+                .finally(() => {
+                this.sessionCreateFlight = null;
+            });
+        }
+        return this.sessionCreateFlight;
     }
     async refreshSession(force) {
+        if (this.sessionCreateFlight) {
+            return this.sessionCreateFlight;
+        }
         const current = this.session;
         if (!current) {
             return this.ensureSession();
@@ -199,9 +302,18 @@ export class LiveRoomSdkImpl {
                 message: 'Ticket sessions cannot be refreshed after expiry.'
             });
         }
-        const next = await this.createSession();
-        this.session = next;
-        return next;
+        if (!this.sessionRefreshFlight) {
+            // 并发 401 只换取一个后台 Operator 会话，后续请求复用同一令牌。
+            this.sessionRefreshFlight = this.createSession()
+                .then((next) => {
+                this.session = next;
+                return next;
+            })
+                .finally(() => {
+                this.sessionRefreshFlight = null;
+            });
+        }
+        return this.sessionRefreshFlight;
     }
     async createSession() {
         let sessionResponse;
@@ -231,7 +343,6 @@ export class LiveRoomSdkImpl {
             sessionResponse = response.data;
         }
         return {
-            sessionId: sessionResponse.session_id,
             accessToken: sessionResponse.access_token,
             expiresAt: parseExpiry(sessionResponse.expires_at)
         };
@@ -246,7 +357,6 @@ export class LiveRoomSdkImpl {
         return response.data;
     }
     applyBootstrap(bootstrap, resetMessages) {
-        this.currentBootstrap = bootstrap;
         this.user.hydrate({
             id: bootstrap.user.id,
             externalId: bootstrap.user.external_id,
@@ -281,23 +391,20 @@ export class LiveRoomSdkImpl {
     }
     async startRealtime() {
         const credential = await this.fetchRealtimeCredential();
-        await this.attachRealtimeSafely(credential);
+        this.assertOpen();
+        return this.attachRealtime(credential);
     }
     async restartRealtime() {
         await this.disposeRealtime();
+        this.assertOpen();
         const credential = await this.fetchRealtimeCredential();
-        await this.attachRealtimeSafely(credential);
-    }
-    async attachRealtimeSafely(credential) {
-        try {
-            await this.attachRealtime(credential);
-        }
-        catch (error) {
-            await this.disposeRealtime();
-            throw error;
-        }
+        this.assertOpen();
+        return this.attachRealtime(credential);
     }
     degradeRealtime(error) {
+        if (this.room.state === 'ended') {
+            return;
+        }
         const normalized = error instanceof Error
             ? error
             : new LiveRoomSdkError({
@@ -308,9 +415,23 @@ export class LiveRoomSdkImpl {
         this.room.setState('degraded');
     }
     async attachRealtime(credential) {
-        this.goeasyConnection = await connectGoEasy(this.runtime, credential.goeasy, (event) => {
-            this.room.applyRealtimeEvent(event);
-        }, this.logger);
+        let error = null;
+        try {
+            this.goeasyConnection = await connectGoEasy(this.runtime, credential.goeasy, (event) => {
+                this.room.applyRealtimeEvent(event);
+            }, this.logger);
+        }
+        catch (connectionError) {
+            error = this.asError(connectionError);
+        }
+        if (this.room.state === 'ended') {
+            await this.disposeRealtime();
+            return null;
+        }
+        if (this.closed) {
+            await this.disposeRealtime();
+            this.assertOpen();
+        }
         if (this.user.role === 'viewer' && credential.websocket?.ticket) {
             const roomSnapshot = this.room.info;
             if (!roomSnapshot) {
@@ -319,27 +440,37 @@ export class LiveRoomSdkImpl {
                     message: 'Room bootstrap must complete before opening websocket.'
                 });
             }
-            this.websocketTransport = new ViewerWebSocketTransport(this.runtime, async () => {
-                const next = await this.fetchRealtimeCredential();
-                if (!next.websocket) {
-                    throw new LiveRoomSdkError({
-                        code: 'WEBSOCKET_AUTH_FAILED',
-                        message: 'Viewer websocket credentials are not available.'
-                    });
-                }
-                return {
-                    url: next.websocket.url,
-                    ticket: next.websocket.ticket
-                };
-            }, {
-                onReady: (online) => this.room.setOnline(online),
-                onOnlineChanged: (online) => this.room.setOnline(online),
-                onRoomStatusChanged: (status) => this.room.setRoomStatus(status),
-                onError: (error) => this.room.emitError(error),
-                onReconnecting: () => this.room.setState('reconnecting')
-            }, roomSnapshot, this.logger);
-            await this.websocketTransport.open();
+            try {
+                this.websocketTransport = new ViewerWebSocketTransport(this.runtime, async () => {
+                    const next = await this.fetchRealtimeCredential();
+                    if (!next.websocket) {
+                        throw new LiveRoomSdkError({
+                            code: 'WEBSOCKET_AUTH_FAILED',
+                            message: 'Viewer websocket credentials are not available.'
+                        });
+                    }
+                    return {
+                        url: next.websocket.url,
+                        ticket: next.websocket.ticket
+                    };
+                }, {
+                    onReady: (online) => this.handleWebSocketReady(online),
+                    onOnlineChanged: (online) => this.room.setOnline(online),
+                    onRoomStatusChanged: (status) => this.room.setRoomStatus(status),
+                    onError: (websocketError) => this.room.emitError(websocketError),
+                    onReconnecting: () => this.room.setState('reconnecting')
+                }, roomSnapshot, this.logger);
+                await this.websocketTransport.open();
+            }
+            catch (connectionError) {
+                error ??= this.asError(connectionError);
+            }
         }
+        if (this.closed) {
+            await this.disposeRealtime();
+            this.assertOpen();
+        }
+        return error;
     }
     async disposeRealtime() {
         const websocket = this.websocketTransport;
@@ -350,14 +481,13 @@ export class LiveRoomSdkImpl {
         await goeasy?.close();
     }
     async catchUpMessages() {
-        const sequence = this.room.getLastSequence();
+        let sequence = this.room.getLastSequence();
         if (sequence === null) {
             return;
         }
         const session = await this.ensureSession();
-        let response;
-        try {
-            response = await this.httpClient.request({
+        while (true) {
+            const response = await this.httpClient.request({
                 method: 'GET',
                 path: '/sdk/v1/rooms/current/messages',
                 query: {
@@ -365,21 +495,23 @@ export class LiveRoomSdkImpl {
                 },
                 accessToken: session.accessToken
             });
-        }
-        catch (error) {
-            if (isMessageHistoryUnavailable(error)) {
+            for (const event of response.data.events ?? []) {
+                this.room.applyRealtimeEvent(event);
+            }
+            this.assertOpen();
+            const nextSequence = response.data.next_sequence;
+            if (!response.data.has_more || typeof nextSequence !== 'number' || nextSequence <= sequence) {
                 return;
             }
-            throw error;
+            sequence = nextSequence;
         }
-        for (const event of response.data.events ?? []) {
-            this.room.applyRealtimeEvent(event);
-        }
+    }
+    async loadInitialMessages() {
+        await this.loadPreviousMessages();
     }
     async refreshInfo() {
         const bootstrap = await this.fetchBootstrap();
         const { snapshot } = normalizeRoomSnapshot(bootstrap);
-        this.currentBootstrap = bootstrap;
         this.room.updateSnapshot(snapshot);
         return snapshot;
     }
@@ -411,7 +543,7 @@ export class LiveRoomSdkImpl {
             accessToken: session.accessToken
         });
         return {
-            messages: response.data.messages ?? [],
+            messages: this.room.hydrateHistory(response.data.messages ?? []),
             nextCursor: response.data.next_cursor,
             hasMore: Boolean(response.data.has_more)
         };
@@ -452,6 +584,10 @@ export class LiveRoomSdkImpl {
                 }
             });
             pending.state = 'accepted';
+            // GoEasy 回声丢失时，仍可从持久化事件按 sequence 补齐。
+            void this.catchUpMessages().catch((catchUpError) => {
+                this.room.emitError(this.asError(catchUpError));
+            });
             return pending;
         }
         catch (error) {
@@ -462,11 +598,28 @@ export class LiveRoomSdkImpl {
     async sendLike(count = 1) {
         this.requireCapability('message:send');
         const session = await this.ensureSession();
-        await this.httpClient.request({
+        const clientRequestId = this.runtime.createId('cr');
+        const response = await this.httpClient.request({
             method: 'POST',
             path: '/sdk/v1/rooms/current/commands/likes',
             accessToken: session.accessToken,
-            body: { count }
+            body: {
+                client_request_id: clientRequestId,
+                count
+            }
+        });
+        // REST 成功与 GoEasy 回声共享 event_id，reducer 会自动去重。
+        this.room.applyRealtimeEvent({
+            event_id: response.data.event_id,
+            event_type: 'engagement.like.delta.v1',
+            room_id: this.room.id,
+            sequence: response.data.sequence,
+            data: {
+                count: response.data.count,
+                total: response.data.total,
+                user_id: this.user.id,
+                client_request_id: clientRequestId
+            }
         });
     }
     async deleteComment(messageId, reason) {
@@ -482,17 +635,14 @@ export class LiveRoomSdkImpl {
             }
         });
     }
-    async muteUser(userId, durationSeconds) {
+    async muteUser(userId) {
         this.requireCapability('user:mute');
         const session = await this.ensureSession();
         await this.httpClient.request({
             method: 'POST',
             path: '/sdk/v1/rooms/current/commands/mute-user',
             accessToken: session.accessToken,
-            body: {
-                user_id: userId,
-                duration_seconds: durationSeconds
-            }
+            body: { user_id: userId }
         });
     }
     async unmuteUser(userId) {
@@ -518,10 +668,7 @@ export class LiveRoomSdkImpl {
         });
     }
     requireCapability(capability) {
-        if (this.user.role === 'operator' && this.user.capabilities.includes(capability)) {
-            return;
-        }
-        if (capability === 'message:send' && this.user.capabilities.includes(capability)) {
+        if (this.user.capabilities.includes(capability)) {
             return;
         }
         throw new LiveRoomSdkError({
@@ -536,6 +683,33 @@ export class LiveRoomSdkImpl {
                 message: 'The SDK has already been closed.'
             });
         }
+    }
+    handleWebSocketReady(online) {
+        this.room.setOnline(online);
+        if (this.room.state !== 'reconnecting') {
+            return;
+        }
+        if (!this.goeasyConnection) {
+            this.room.setState('degraded');
+            return;
+        }
+        void this.catchUpMessages()
+            .then(() => {
+            this.room.drainBufferedEvents();
+            if (this.room.state === 'reconnecting') {
+                this.room.setState('ready');
+            }
+        })
+            .catch((error) => this.degradeRealtime(error));
+    }
+    asError(error) {
+        return error instanceof Error
+            ? error
+            : new LiveRoomSdkError({
+                code: 'NETWORK_ERROR',
+                message: 'Realtime connection failed.',
+                cause: error
+            });
     }
 }
 export function createLiveRoomSdk(options) {

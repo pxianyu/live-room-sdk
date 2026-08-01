@@ -9,7 +9,7 @@ function defaultCreateId(prefix) {
     return `${prefix}_${Date.now()}_${fallbackId}`;
 }
 export function createDefaultRuntime(fetchOverride, logger) {
-    const runtimeFetch = fetchOverride ?? globalThis.fetch;
+    const runtimeFetch = fetchOverride ?? globalThis.fetch?.bind(globalThis);
     if (typeof runtimeFetch !== 'function') {
         throw new LiveRoomSdkError({
             code: 'INVALID_RESPONSE',

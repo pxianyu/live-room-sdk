@@ -52,6 +52,8 @@ const sdk = createLiveRoomSdk({
 await sdk.connect();
 ```
 
+`/api/sdk/v1` 是平台后台的同源入口；客户系统应使用开放平台根地址，使 SDK 请求 `/sdk/v1`。
+
 ## Public API
 
 ```ts
@@ -93,7 +95,7 @@ interface LiveRoom {
   sendLike(count?: number): Promise<void>;
 
   deleteComment(messageId: string, reason?: string): Promise<void>;
-  muteUser(userId: string, durationSeconds?: number): Promise<void>;
+  muteUser(userId: string): Promise<void>;
   unmuteUser(userId: string): Promise<void>;
   setRoomMute(enabled: boolean): Promise<void>;
 
@@ -125,13 +127,10 @@ The SDK expects these endpoints:
 ## Current Release Availability
 
 Session exchange, bootstrap, protected GoEasy subscription, viewer WebSocket presence,
-media refresh, and session close are available in the current server release.
-
-Message history and interaction commands are intentionally gated by the server with
-`501 FEATURE_NOT_AVAILABLE` until persistent message storage, outbox publishing,
-event sequencing, and catch-up are enabled. The corresponding SDK methods are already
-typed so the server capability can be enabled without changing the public package
-surface, but applications must not present those controls as available yet.
+media refresh, persistent message history, comments, likes, moderation commands, and
+session close are available in the current server release. Comment and like commands
+are persisted as ordered room events; the browser SDK deduplicates the REST result and
+its GoEasy echo by `event_id`.
 
 ## Events
 
@@ -142,6 +141,7 @@ type RoomEventName =
   | 'online.changed'
   | 'message.created'
   | 'message.deleted'
+  | 'like.changed'
   | 'user.muted'
   | 'room.muted'
   | 'notice.updated'
@@ -153,6 +153,11 @@ const unsubscribe = sdk.room.on('message.created', ({ message }) => {
   console.log(message.messageId, message.content.text);
 });
 ```
+
+## Error Handling
+
+`LiveRoomSdkError.status` is the HTTP status. `businessCode` is the numeric business
+status returned by the platform, while `code` remains the stable string error identifier.
 
 ## Security Boundaries
 

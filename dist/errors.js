@@ -3,6 +3,7 @@ export class LiveRoomSdkError extends Error {
     requestId;
     retryable;
     status;
+    businessCode;
     constructor(init) {
         super(init.message, init.cause ? { cause: init.cause } : undefined);
         this.name = 'LiveRoomSdkError';
@@ -10,6 +11,7 @@ export class LiveRoomSdkError extends Error {
         this.requestId = init.requestId;
         this.retryable = init.retryable ?? false;
         this.status = init.status;
+        this.businessCode = init.businessCode;
     }
 }
 export function isLiveRoomSdkError(error) {

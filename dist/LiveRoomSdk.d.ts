@@ -13,13 +13,15 @@ export declare class LiveRoomSdkImpl implements LiveRoomSdk {
     private readonly runtime;
     private readonly httpClient;
     private readonly authClient;
+    private readonly requestAbortController;
     private session;
-    private currentBootstrap;
     private goeasyConnection;
     private websocketTransport;
     private closed;
+    private sessionCreateFlight;
     private connectFlight;
     private refreshFlight;
+    private sessionRefreshFlight;
     private closeFlight;
     constructor(options: LiveRoomSdkOptions, runtimeOptions?: LiveRoomSdkRuntimeOptions);
     connect(): Promise<void>;
@@ -36,11 +38,11 @@ export declare class LiveRoomSdkImpl implements LiveRoomSdk {
     private fetchRealtimeCredential;
     private startRealtime;
     private restartRealtime;
-    private attachRealtimeSafely;
     private degradeRealtime;
     private attachRealtime;
     private disposeRealtime;
     private catchUpMessages;
+    private loadInitialMessages;
     private refreshInfo;
     private refreshMedia;
     private loadPreviousMessages;
@@ -52,6 +54,8 @@ export declare class LiveRoomSdkImpl implements LiveRoomSdk {
     private setRoomMute;
     private requireCapability;
     private assertOpen;
+    private handleWebSocketReady;
+    private asError;
 }
 export declare function createLiveRoomSdk(options: LiveRoomSdkOptions): LiveRoomSdk;
 export {};

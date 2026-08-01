@@ -79,7 +79,7 @@ function defaultCreateId(prefix: string): string {
 }
 
 export function createDefaultRuntime(fetchOverride: typeof fetch | undefined, logger?: LiveRoomLogger): LiveRoomRuntime {
-  const runtimeFetch = fetchOverride ?? globalThis.fetch;
+  const runtimeFetch = fetchOverride ?? globalThis.fetch?.bind(globalThis);
   if (typeof runtimeFetch !== 'function') {
     throw new LiveRoomSdkError({
       code: 'INVALID_RESPONSE',

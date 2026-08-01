@@ -92,6 +92,17 @@ export async function connectGoEasy(
       });
     });
   } catch (error) {
+    await new Promise<void>((resolve) => {
+      if (typeof instance.disconnect !== 'function') {
+        resolve();
+        return;
+      }
+
+        instance.disconnect({
+          onSuccess: resolve,
+          onFailed: () => resolve()
+        });
+    });
     throw wrapGoEasyError('GOEASY_SUBSCRIBE_FAILED', error);
   }
 

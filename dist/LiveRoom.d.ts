@@ -9,7 +9,7 @@ export interface RoomDelegate {
     sendComment(text: string): Promise<PendingMessage>;
     sendLike(count?: number): Promise<void>;
     deleteComment(messageId: string, reason?: string): Promise<void>;
-    muteUser(userId: string, durationSeconds?: number): Promise<void>;
+    muteUser(userId: string): Promise<void>;
     unmuteUser(userId: string): Promise<void>;
     setRoomMute(enabled: boolean): Promise<void>;
 }
@@ -33,7 +33,7 @@ export declare class LiveRoomState implements LiveRoom {
     sendComment(text: string): Promise<PendingMessage>;
     sendLike(count?: number): Promise<void>;
     deleteComment(messageId: string, reason?: string): Promise<void>;
-    muteUser(userId: string, durationSeconds?: number): Promise<void>;
+    muteUser(userId: string): Promise<void>;
     unmuteUser(userId: string): Promise<void>;
     setRoomMute(enabled: boolean): Promise<void>;
     on<T extends RoomEventName>(event: T, handler: RoomEventHandler<T>): () => void;
@@ -47,10 +47,10 @@ export declare class LiveRoomState implements LiveRoom {
     applyRealtimeEvent(event: RealtimeEnvelope): void;
     drainBufferedEvents(): void;
     trackPending(message: PendingMessage): void;
+    hydrateHistory(messages: ReadonlyArray<Record<string, unknown>>): RoomMessage[];
     getLastSequence(): number | null;
     emitError(error: Error): void;
     private emitReducerEvents;
     private requireSnapshot;
-    requireCapability(capability: string): void;
 }
 //# sourceMappingURL=LiveRoom.d.ts.map

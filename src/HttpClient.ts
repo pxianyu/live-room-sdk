@@ -7,18 +7,24 @@ export interface HttpClientRequest {
   query?: Record<string, string | number | undefined>;
   body?: unknown;
   accessToken?: string;
-  signal?: AbortSignal;
+  signal?: AbortSignal | null;
   retryOnUnauthorized?: boolean;
 }
 
 export interface HttpClientOptions {
   baseUrl: string;
   fetch: typeof fetch;
+  signal?: AbortSignal;
   onUnauthorized?: () => Promise<string | null>;
 }
 
 function joinUrl(baseUrl: string, path: string, query?: Record<string, string | number | undefined>): string {
-  const url = new URL(path.replace(/^\//, ''), baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+  const absoluteBaseUrl = /^[a-z][a-z\d+.-]*:\/\//i.test(baseUrl);
+  const normalizedBaseUrl = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  const url = new URL(
+    path.replace(/^\//, ''),
+    absoluteBaseUrl ? normalizedBaseUrl : new URL(normalizedBaseUrl || '/', 'http://live-room-sdk.local').toString(),
+  );
   if (query) {
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined) {
@@ -26,7 +32,7 @@ function joinUrl(baseUrl: string, path: string, query?: Record<string, string | 
       }
     }
   }
-  return url.toString();
+  return absoluteBaseUrl ? url.toString() : `${url.pathname}${url.search}`;
 }
 
 function inferErrorCode(status: number, fallback: string | undefined): LiveRoomSdkError['code'] {
@@ -38,7 +44,6 @@ function inferErrorCode(status: number, fallback: string | undefined): LiveRoomS
     case 'CAPABILITY_DENIED':
     case 'USER_MUTED':
     case 'RATE_LIMITED':
-    case 'FEATURE_NOT_AVAILABLE':
     case 'GOEASY_CONNECT_FAILED':
     case 'GOEASY_SUBSCRIBE_FAILED':
     case 'WEBSOCKET_AUTH_FAILED':
@@ -46,6 +51,12 @@ function inferErrorCode(status: number, fallback: string | undefined): LiveRoomS
     case 'SDK_CLOSED':
     case 'INVALID_RESPONSE':
     case 'AUTHENTICATION_REQUIRED':
+    case 'VALIDATION_FAILED':
+    case 'CONFLICT':
+    case 'RESOURCE_NOT_FOUND':
+    case 'INVALID_REQUEST':
+    case 'BODY_TOO_LARGE':
+    case 'INTERNAL_ERROR':
       return fallback;
     default:
       return status === 401 ? 'SESSION_EXPIRED' : 'NETWORK_ERROR';
@@ -72,20 +83,24 @@ export class HttpClient {
       if (request.body !== undefined) {
         init.body = JSON.stringify(request.body);
       }
-      if (request.signal) {
-        init.signal = request.signal;
+      const signal = request.signal === undefined ? this.options.signal : request.signal;
+      if (signal) {
+        init.signal = signal;
       }
 
       const response = await this.options.fetch(joinUrl(this.options.baseUrl, request.path, request.query), init);
+      const text = await response.text();
+      let envelope: ApiEnvelope<T>;
 
-      const envelope = (await response.json().catch(async () => {
-        const text = await response.text();
+      try {
+        envelope = JSON.parse(text) as ApiEnvelope<T>;
+      } catch {
         throw new LiveRoomSdkError({
           code: 'INVALID_RESPONSE',
           message: `Expected JSON response but received: ${text.slice(0, 120)}`,
           status: response.status
         });
-      })) as ApiEnvelope<T>;
+      }
 
       if (response.status === 401 && request.retryOnUnauthorized !== false && !retried && this.options.onUnauthorized) {
         const nextToken = await this.options.onUnauthorized();
@@ -106,7 +121,8 @@ export class HttpClient {
           message: envelope.error?.message ?? response.statusText,
           requestId: envelope.request_id,
           retryable: envelope.error?.retryable ?? response.status >= 500,
-          status: response.status
+          status: response.status,
+          businessCode: typeof envelope.status === 'number' ? envelope.status : undefined
         });
       }
 
