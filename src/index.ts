@@ -1,19 +1,22 @@
-export { createLiveRoomSdk } from './LiveRoomSdk.js';
-export { LiveRoomSdkError, isLiveRoomSdkError } from './errors.js';
+export {
+  createLiveRoomSdk,
+  LIVE_CONTENT_TYPE,
+  messageType,
+  parseGoEasyMessage,
+} from './LiveRoomSdk.js';
 export type {
-  LiveRoom,
-  LiveRoomEventMap,
-  LiveRoomLogger,
+  GoEasyCallbacks,
+  GoEasyChatConfig,
+  GoEasyConnection,
+  GoEasyMessage,
+  LiveApiClient,
+  LiveApiMethod,
+  LiveApiRequest,
+  LiveApiResponse,
   LiveRoomSdk,
   LiveRoomSdkOptions,
-  LiveRoomUser,
-  MediaSource,
-  MessagePage,
-  PendingMessage,
-  RoomCapability,
-  RoomConnectionState,
-  RoomEventHandler,
-  RoomEventName,
-  RoomMessage,
-  RoomSnapshot
+  LiveUser,
+  ViewingCallbacks,
+  ViewingConnection,
+  ViewingContext,
 } from './types.js';

@@ -1,16 +1,32 @@
 import { createLiveRoomSdk } from '@company/live-room-sdk';
 
+declare const credential: {
+  api_base_url: string;
+  access_token: string;
+  websocket_url: string;
+  uniacid: number;
+};
+
 const sdk = createLiveRoomSdk({
-  apiBaseUrl: 'https://open.example.com',
-  auth: {
-    type: 'ticket',
-    ticket: 'operator-ticket'
-  }
+  apiBaseUrl: credential.api_base_url,
+  accessToken: credential.access_token,
+  websocketUrl: credential.websocket_url,
+  uniacid: credential.uniacid,
+  liveId: 2685,
 });
 
-sdk.room.on('message.created', ({ message }) => {
-  console.log('operator saw message', message.messageId);
+const users = await sdk.api.getAction('/live/get_online_users', {
+  page: 1,
+  limit: 20,
 });
 
-await sdk.connect();
-await sdk.room.deleteComment('msg_01', 'operator_action');
+if (users.status !== 200) {
+  throw new Error(users.msg ?? users.message ?? '在线用户加载失败');
+}
+
+await sdk.api.postAction('/anchor/set-user-shutup', {
+  uid: 10086,
+  type: 1,
+});
+
+await sdk.close();

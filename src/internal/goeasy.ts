@@ -1,137 +1,122 @@
-import { LiveRoomSdkError } from '../errors.js';
-import type { LiveRoomLogger, RealtimeCredentialResponse, RealtimeEnvelope } from '../types.js';
-import type { GoEasyConnectError, GoEasyInstance, LiveRoomRuntime } from './runtime.js';
+import type { GoEasyCallbacks, GoEasyChatConfig, GoEasyConnection, GoEasyMessage, LiveUser } from '../types.js';
 
-export interface GoEasyConnection {
-  close(): Promise<void>;
+interface GoEasyError {
+  code?: string | number;
+  content?: string;
+  message?: string;
 }
 
-function describeGoEasyError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  if (typeof error === 'object' && error !== null) {
-    const details = error as GoEasyConnectError;
-    return String(details.content ?? details.message ?? details.code ?? 'unknown error');
-  }
-
-  return String(error ?? 'unknown error');
+interface GoEasyInstance {
+  connect(options: { otp: string; id: string; data: Record<string, unknown>; onSuccess: () => void; onFailed: (error: GoEasyError) => void }): void;
+  disconnect?(options: { onSuccess: () => void; onFailed: () => void }): void;
+  pubsub: {
+    subscribe(options: { channel: string; presence: { enable: true }; onMessage: (message: { content: string }) => void; onSuccess: () => void; onFailed: (error: GoEasyError) => void }): void;
+    subscribePresence?(options: { channel: string; membersLimit: number; onPresence: (event: unknown) => void; onSuccess: () => void; onFailed: (error: GoEasyError) => void }): void;
+    unsubscribe?(options: { channel: string; onSuccess: () => void; onFailed: () => void }): void;
+    publish(options: { channel: string; qos: number; message: string; onSuccess: () => void; onFailed: (error: GoEasyError) => void }): void;
+    hereNow(options: { channel: string; limit: number; onSuccess: (response: { content: unknown }) => void; onFailed: (error: GoEasyError) => void }): void;
+  };
 }
 
-function parseRealtimePayload(content: string | Record<string, unknown> | undefined): RealtimeEnvelope | null {
-  if (!content) {
-    return null;
-  }
+interface GoEasyModule {
+  getInstance(options: { host: string; appkey: string; modules: ['pubsub'] }): GoEasyInstance;
+}
 
+function errorMessage(error: GoEasyError): string {
+  return error.content ?? error.message ?? String(error.code ?? 'GoEasy 请求失败');
+}
+
+function callbackPromise(callback: (resolve: () => void, reject: (error: GoEasyError) => void) => void): Promise<void> {
+  return new Promise((resolve, reject) => callback(resolve, reject));
+}
+
+export function parseGoEasyMessage(value: unknown): GoEasyMessage {
+  const content = typeof value === 'object' && value !== null && 'content' in value
+    ? (value as { content: unknown }).content
+    : value;
   if (typeof content === 'string') {
-    return JSON.parse(content) as RealtimeEnvelope;
+    return JSON.parse(content) as GoEasyMessage;
+  }
+  if (typeof content === 'object' && content !== null) {
+    return content as GoEasyMessage;
   }
 
-  return content as RealtimeEnvelope;
-}
-
-function wrapGoEasyError(code: 'GOEASY_CONNECT_FAILED' | 'GOEASY_SUBSCRIBE_FAILED', error: unknown): LiveRoomSdkError {
-  return new LiveRoomSdkError({
-    code,
-    message: describeGoEasyError(error),
-    retryable: true,
-    cause: error
-  });
+  throw new Error('GoEasy 消息格式无效');
 }
 
 export async function connectGoEasy(
-  runtime: LiveRoomRuntime,
-  credential: RealtimeCredentialResponse['goeasy'],
-  onEvent: (event: RealtimeEnvelope) => void,
-  logger?: LiveRoomLogger
+  config: GoEasyChatConfig,
+  user: LiveUser,
+  liveId: string | number,
+  callbacks: GoEasyCallbacks = {},
 ): Promise<GoEasyConnection> {
-  let instance: GoEasyInstance;
-  try {
-    const module = await runtime.loadGoEasy();
-    instance = module.getInstance({
-      host: credential.host,
-      appkey: credential.client_key,
-      modules: ['pubsub']
-    });
-  } catch (error) {
-    throw wrapGoEasyError('GOEASY_CONNECT_FAILED', error);
-  }
+  const imported = await import('goeasy');
+  const module = (imported.default ?? imported) as unknown as GoEasyModule;
+  const instance = module.getInstance({
+    host: config.host,
+    appkey: config.authorization.client_key,
+    modules: ['pubsub'],
+  });
+  const channel = String(liveId);
+  const userData = {
+    id: user.id,
+    nickname: user.nickname,
+    avatar: user.avatar,
+    spid: user.spid ?? 0,
+    city: user.city ?? '',
+  };
 
-  try {
-    await new Promise<void>((resolve, reject) => {
-      instance.connect({
-        id: credential.connect_id,
-        otp: credential.otp,
-        onSuccess: resolve,
-        onFailed: reject
-      });
-    });
-  } catch (error) {
-    throw wrapGoEasyError('GOEASY_CONNECT_FAILED', error);
-  }
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      instance.pubsub.subscribe({
-        channel: credential.channel,
-        accessToken: credential.access_token,
-        onMessage: (message) => {
-          try {
-            const payload = parseRealtimePayload(message.content);
-            if (payload) {
-              onEvent(payload);
-            }
-          } catch (error) {
-            logger?.warn?.('Discarded invalid GoEasy payload', {
-              error: error instanceof Error ? error.message : String(error)
-            });
-          }
-        },
-        onSuccess: resolve,
-        onFailed: reject
-      });
-    });
-  } catch (error) {
-    await new Promise<void>((resolve) => {
-      if (typeof instance.disconnect !== 'function') {
-        resolve();
-        return;
+  await callbackPromise((resolve, reject) => instance.connect({
+    otp: config.authorization.otp,
+    id: String(user.id),
+    data: userData,
+    onSuccess: resolve,
+    onFailed: reject,
+  }));
+  await callbackPromise((resolve, reject) => instance.pubsub.subscribe({
+    channel,
+    presence: { enable: true },
+    onMessage: (message) => {
+      try {
+        callbacks.onMessage?.(parseGoEasyMessage(message));
+      } catch (error) {
+        callbacks.onError?.(error);
       }
-
-        instance.disconnect({
-          onSuccess: resolve,
-          onFailed: () => resolve()
-        });
+    },
+    onSuccess: resolve,
+    onFailed: reject,
+  }));
+  if (callbacks.onPresence && instance.pubsub.subscribePresence) {
+    instance.pubsub.subscribePresence({
+      channel,
+      membersLimit: 20,
+      onPresence: callbacks.onPresence,
+      onSuccess: () => undefined,
+      onFailed: (error) => callbacks.onError?.(error),
     });
-    throw wrapGoEasyError('GOEASY_SUBSCRIBE_FAILED', error);
   }
 
   return {
-    async close(): Promise<void> {
-      await new Promise<void>((resolve) => {
-        if (typeof instance.pubsub.unsubscribe !== 'function') {
-          resolve();
-          return;
-        }
-
-        instance.pubsub.unsubscribe({
-          channel: credential.channel,
-          onSuccess: resolve,
-          onFailed: () => resolve()
-        });
-      });
-
-      await new Promise<void>((resolve) => {
-        if (typeof instance.disconnect !== 'function') {
-          resolve();
-          return;
-        }
-
-        instance.disconnect({
-          onSuccess: resolve,
-          onFailed: () => resolve()
-        });
-      });
-    }
+    publish: (message) => callbackPromise((resolve, reject) => instance.pubsub.publish({
+      channel,
+      qos: config.host === 'hangzhou.goeasy.io' ? -1 : 0,
+      message: JSON.stringify(message),
+      onSuccess: resolve,
+      onFailed: reject,
+    })),
+    getOnlineUsers: () => new Promise((resolve, reject) => instance.pubsub.hereNow({
+      channel,
+      limit: 20,
+      onSuccess: (response) => resolve(response.content),
+      onFailed: reject,
+    })),
+    close: async () => {
+      if (instance.pubsub.unsubscribe) {
+        await callbackPromise((resolve) => instance.pubsub.unsubscribe?.({ channel, onSuccess: resolve, onFailed: resolve }));
+      }
+      if (instance.disconnect) {
+        await callbackPromise((resolve) => instance.disconnect?.({ onSuccess: resolve, onFailed: resolve }));
+      }
+    },
   };
 }

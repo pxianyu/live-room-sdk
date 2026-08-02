@@ -1,7 +1,4 @@
-import type { LiveRoomLogger, RealtimeCredentialResponse, RealtimeEnvelope } from '../types.js';
-import type { LiveRoomRuntime } from './runtime.js';
-export interface GoEasyConnection {
-    close(): Promise<void>;
-}
-export declare function connectGoEasy(runtime: LiveRoomRuntime, credential: RealtimeCredentialResponse['goeasy'], onEvent: (event: RealtimeEnvelope) => void, logger?: LiveRoomLogger): Promise<GoEasyConnection>;
+import type { GoEasyCallbacks, GoEasyChatConfig, GoEasyConnection, GoEasyMessage, LiveUser } from '../types.js';
+export declare function parseGoEasyMessage(value: unknown): GoEasyMessage;
+export declare function connectGoEasy(config: GoEasyChatConfig, user: LiveUser, liveId: string | number, callbacks?: GoEasyCallbacks): Promise<GoEasyConnection>;
 //# sourceMappingURL=goeasy.d.ts.map

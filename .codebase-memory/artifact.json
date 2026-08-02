@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "3d22e6294900c6dc9d5fcaeda0ef1fcbc5c6137a",
+    "indexed_at": "2026-08-02T07:57:10Z",
+    "project": "live_room_sdk",
+    "nodes": 101,
+    "edges": 189,
+    "original_size": 1376256,
+    "compressed_size": 120994,
+    "compression_level": 9
+}

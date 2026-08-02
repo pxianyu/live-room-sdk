@@ -1,332 +1,141 @@
-import { LiveRoomSdkError } from '../errors.js';
-import type { LiveRoomLogger, RoomSnapshot } from '../types.js';
-import type { LiveRoomRuntime, WebSocketLike } from './runtime.js';
+import type { LiveUser, ViewingCallbacks, ViewingConnection, ViewingContext } from '../types.js';
 
-const READY_TIMEOUT_MS = 10_000;
-
-export interface ViewerWebSocketCredential {
-  url: string;
-  ticket: string;
+interface ViewingOptions {
+  websocketUrl: string;
+  accessToken: string;
+  uniacid: string | number;
+  liveId: string | number;
+  user: LiveUser;
+  callbacks: ViewingCallbacks;
+  context: ViewingContext;
+  webSocketFactory?: (url: string) => WebSocket;
 }
 
-export interface ViewerWebSocketCallbacks {
-  onReady(online: number | null): void;
-  onOnlineChanged(online: number | null): void;
-  onRoomStatusChanged(status: string): void;
-  onError(error: Error): void;
-  onReconnecting(): void;
+function socketUrl(options: ViewingOptions): string {
+  const url = new URL(options.websocketUrl);
+  url.searchParams.set('uniacid', String(options.uniacid));
+  url.searchParams.set('live_id', String(options.liveId));
+  url.searchParams.set('live_log_id', String(options.context.liveLogId ?? 0));
+  url.searchParams.set('watch_scene', options.context.watchScene === 'playback' ? 'playback' : 'live');
+  url.searchParams.set('material_id', String(options.context.materialId ?? 0));
+  url.searchParams.set('file_id', options.context.fileId ?? '');
+  url.searchParams.set('user_type', '0');
+  url.searchParams.set('access_token', options.accessToken);
+  return url.toString();
 }
 
-interface MessageEventLike {
-  data?: string;
-}
+export function connectViewingSocket(options: ViewingOptions): ViewingConnection {
+  let socket: WebSocket | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectAttempts = 0;
+  let manualClose = false;
+  const context = {
+    liveLogId: options.context.liveLogId ?? 0,
+    watchScene: options.context.watchScene === 'playback' ? 'playback' : 'live',
+    materialId: options.context.materialId ?? 0,
+    fileId: options.context.fileId ?? '',
+  };
 
-interface CloseEventLike {
-  code?: number;
-}
-
-export class ViewerWebSocketTransport {
-  private socket: WebSocketLike | null = null;
-  private connectPromise: Promise<void> | null = null;
-  private closed = false;
-  private socketGeneration = 0;
-  private reconnectAttempts = 0;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private detachSocketListeners: (() => void) | null = null;
-  private cancelOpen: ((error: Error) => void) | null = null;
-
-  constructor(
-    private readonly runtime: LiveRoomRuntime,
-    private readonly getCredential: () => Promise<ViewerWebSocketCredential>,
-    private readonly callbacks: ViewerWebSocketCallbacks,
-    private readonly room: RoomSnapshot,
-    private readonly logger?: LiveRoomLogger
-  ) {}
-
-  open(): Promise<void> {
-    if (this.closed) {
-      return Promise.reject(
-        new LiveRoomSdkError({
-          code: 'SDK_CLOSED',
-          message: 'The SDK has already been closed.'
-        })
-      );
+  const send = (message: Record<string, unknown>) => {
+    if (socket?.readyState === 1) {
+      socket.send(JSON.stringify(message));
     }
-
-    if (this.connectPromise) {
-      return this.connectPromise;
+  };
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
     }
-
-    this.connectPromise = this.connectNextSocket();
-    return this.connectPromise;
-  }
-
-  async close(): Promise<void> {
-    this.closed = true;
-    this.connectPromise = null;
-    this.stopHeartbeat();
-    this.clearReconnectTimer();
-    this.socketGeneration += 1;
-    this.cancelOpen?.(new LiveRoomSdkError({
-      code: 'SDK_CLOSED',
-      message: 'The SDK has already been closed.'
-    }));
-    this.cancelOpen = null;
-    this.detachSocketListeners?.();
-    this.detachSocketListeners = null;
-
-    const currentSocket = this.socket;
-    this.socket = null;
-    currentSocket?.close(1000, 'sdk.close');
-  }
-
-  private async connectNextSocket(): Promise<void> {
-    const credential = await this.getCredential();
-    if (this.closed) {
-      throw new LiveRoomSdkError({
-        code: 'SDK_CLOSED',
-        message: 'The SDK has already been closed.'
-      });
+  };
+  const sendLeave = () => send({
+    type: 'leave',
+    uniacid: options.uniacid,
+    live_id: options.liveId,
+    live_log_id: context.liveLogId,
+    watch_scene: context.watchScene,
+    material_id: context.materialId,
+    file_id: context.fileId,
+    uid: options.user.id,
+  });
+  const reconnect = () => {
+    if (manualClose || reconnectAttempts >= 5) {
+      return;
     }
-    const generation = ++this.socketGeneration;
-    const socket = this.runtime.createWebSocket(credential.url);
-    this.socket = socket;
-
-    await new Promise<void>((resolve, reject) => {
-      let resolved = false;
-      let readyTimer: ReturnType<typeof setTimeout> | null = null;
-
-      const clearReadyTimer = () => {
-        if (readyTimer) {
-          this.runtime.clearTimeout(readyTimer);
-          readyTimer = null;
-        }
-      };
-
-      const cleanup = () => {
-        clearReadyTimer();
-        socket.removeEventListener('open', handleOpen as EventListener);
-        socket.removeEventListener('message', handleMessage as EventListener);
-        socket.removeEventListener('close', handleClose as EventListener);
-        socket.removeEventListener('error', handleError as EventListener);
-        if (this.detachSocketListeners === cleanup) {
-          this.detachSocketListeners = null;
-        }
-        if (this.cancelOpen === fail) {
-          this.cancelOpen = null;
-        }
-      };
-      this.detachSocketListeners?.();
-      this.detachSocketListeners = cleanup;
-
-      const fail = (error: Error) => {
-        if (resolved) {
-          return;
-        }
-        resolved = true;
-        cleanup();
-        reject(error);
-      };
-
-      this.cancelOpen = fail;
-
-      const succeed = () => {
-        if (resolved) {
-          return;
-        }
-        resolved = true;
-        clearReadyTimer();
-        this.reconnectAttempts = 0;
-        resolve();
-      };
-
-      const handleOpen = () => {
-        if (generation !== this.socketGeneration || this.closed) {
-          return;
-        }
-
-        socket.send(
-          JSON.stringify({
-            type: 'room.auth',
-            ticket: credential.ticket,
-            protocol_version: '1.0'
-          })
-        );
-      };
-
-      const handleMessage = (event: MessageEventLike) => {
-        if (generation !== this.socketGeneration || this.closed) {
-          return;
-        }
-
-        let payload: Record<string, unknown>;
-        try {
-          payload = JSON.parse(String(event.data ?? '{}')) as Record<string, unknown>;
-        } catch (error) {
-          this.logger?.warn?.('Discarded invalid websocket payload', {
-            error: error instanceof Error ? error.message : String(error)
-          });
-          return;
-        }
-
-        switch (payload.type) {
-          case 'room.ready': {
-            const heartbeatInterval = typeof payload.heartbeat_interval === 'number' ? payload.heartbeat_interval : 15;
-            const room = (payload.room ?? {}) as Record<string, unknown>;
-            const online = typeof room.online === 'number' ? room.online : null;
-            this.callbacks.onReady(online);
-            this.startHeartbeat(heartbeatInterval, generation);
-            succeed();
-            return;
-          }
-          case 'room.online.changed':
-            this.callbacks.onOnlineChanged(typeof payload.online === 'number' ? payload.online : null);
-            return;
-          case 'room.status.changed':
-            if (typeof payload.status === 'string') {
-              this.room.status = payload.status;
-              this.callbacks.onRoomStatusChanged(payload.status);
-            }
-            return;
-          case 'room.kicked':
-            {
-              const error = new LiveRoomSdkError({
-                code: 'WEBSOCKET_AUTH_FAILED',
-                message: 'The room websocket session was revoked.'
-              });
-              this.closed = true;
-              this.clearReconnectTimer();
-              this.stopHeartbeat();
-              if (this.socket === socket) {
-                this.socket = null;
-              }
-              this.callbacks.onError(error);
-              if (!resolved) {
-                fail(error);
-              } else {
-                cleanup();
-              }
-            }
-            socket.close(4001, 'kicked');
-            return;
-          case 'error':
-            fail(
-              new LiveRoomSdkError({
-                code: 'WEBSOCKET_AUTH_FAILED',
-                message: typeof payload.message === 'string' ? payload.message : 'Room websocket failed.'
-              })
-            );
-            socket.close(4000, 'error');
-            return;
-          default:
-            return;
-        }
-      };
-
-      const handleError = () => {
-        if (resolved) {
-          return;
-        }
-        fail(
-          new LiveRoomSdkError({
-            code: 'WEBSOCKET_AUTH_FAILED',
-            message: 'Failed to establish the room websocket.',
-            retryable: true
-          })
-        );
-        socket.close(4000, 'error');
-      };
-
-      const handleClose = (event: CloseEventLike) => {
-        if (generation !== this.socketGeneration) {
-          return;
-        }
-
-        cleanup();
-        this.stopHeartbeat();
-        this.socket = null;
-        this.connectPromise = null;
-
-        if (!resolved) {
-          fail(
-            new LiveRoomSdkError({
-              code: 'WEBSOCKET_AUTH_FAILED',
-              message: `Room websocket closed before ready (${event.code ?? 1006}).`,
-              retryable: true
-            })
-          );
-          return;
-        }
-
-        const roomEnded = ['STOPPED', 'ENDED'].includes((this.room.status ?? '').toUpperCase());
-        if (!this.closed && !roomEnded) {
-          this.callbacks.onReconnecting();
-          this.scheduleReconnect();
-        }
-      };
-
-      socket.addEventListener('open', handleOpen as EventListener);
-      socket.addEventListener('message', handleMessage as EventListener);
-      socket.addEventListener('close', handleClose as EventListener);
-      socket.addEventListener('error', handleError as EventListener);
-      readyTimer = this.runtime.setTimeout(() => {
-        fail(new LiveRoomSdkError({
-          code: 'WEBSOCKET_AUTH_FAILED',
-          message: 'Room websocket did not become ready in time.',
-          retryable: true
-        }));
-        socket.close(4000, 'ready_timeout');
-      }, READY_TIMEOUT_MS);
-    }).catch((error) => {
-      this.connectPromise = null;
-      if (!this.closed) {
-        this.callbacks.onReconnecting();
-        this.scheduleReconnect();
-      }
-      throw error;
-    });
-
-    this.connectPromise = null;
-  }
-
-  private startHeartbeat(intervalSeconds: number, generation: number): void {
-    this.stopHeartbeat();
-    this.heartbeatTimer = this.runtime.setInterval(() => {
-      if (generation !== this.socketGeneration || this.closed || !this.socket) {
+    reconnectAttempts += 1;
+    options.callbacks.onReconnecting?.(reconnectAttempts);
+    reconnectTimer = setTimeout(open, Math.min(2000 * (2 ** (reconnectAttempts - 1)), 30000));
+  };
+  const open = () => {
+    const factory = options.webSocketFactory ?? ((url: string) => new WebSocket(url));
+    const nextSocket = factory(socketUrl(options));
+    socket = nextSocket;
+    nextSocket.onopen = () => {
+      if (socket !== nextSocket) {
         return;
       }
-
-      this.socket.send(JSON.stringify({ type: 'room.heartbeat' }));
-    }, Math.max(intervalSeconds, 1) * 1000);
-  }
-
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      this.runtime.clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-  }
-
-  private scheduleReconnect(): void {
-    this.clearReconnectTimer();
-    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 15000);
-    this.reconnectAttempts += 1;
-    this.reconnectTimer = this.runtime.setTimeout(() => {
-      this.reconnectTimer = null;
-      if (this.closed) {
+      reconnectAttempts = 0;
+      send({
+        type: 'enter',
+        uniacid: options.uniacid,
+        live_id: options.liveId,
+        live_log_id: context.liveLogId,
+        watch_scene: context.watchScene,
+        material_id: context.materialId,
+        file_id: context.fileId,
+        uid: options.user.id,
+        random_user: options.context.randomUser,
+      });
+      stopHeartbeat();
+      heartbeatTimer = setInterval(() => send({
+        type: 'heartbeat',
+        uniacid: options.uniacid,
+        live_id: options.liveId,
+        live_log_id: context.liveLogId,
+        watch_scene: context.watchScene,
+        material_id: context.materialId,
+        file_id: context.fileId,
+        token: options.accessToken,
+        user_type: 0,
+      }), 2000);
+      options.callbacks.onOpen?.();
+    };
+    nextSocket.onmessage = (event) => {
+      const text = String(event.data ?? '').trim();
+      if (text === 'Pong' || text === 'Ping' || text.startsWith('P')) {
         return;
       }
-      void this.open().catch((error) => {
-        this.callbacks.onError(error as Error);
-      });
-    }, delay);
-  }
+      try {
+        options.callbacks.onMessage?.(JSON.parse(text));
+      } catch {
+        options.callbacks.onMessage?.(event.data);
+      }
+    };
+    nextSocket.onerror = (error) => options.callbacks.onError?.(error);
+    nextSocket.onclose = (event) => {
+      if (socket !== nextSocket) {
+        return;
+      }
+      socket = null;
+      stopHeartbeat();
+      options.callbacks.onClose?.(event);
+      reconnect();
+    };
+  };
 
-  private clearReconnectTimer(): void {
-    if (this.reconnectTimer) {
-      this.runtime.clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-  }
+  open();
+  return {
+    send,
+    close: () => {
+      manualClose = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      sendLeave();
+      stopHeartbeat();
+      socket?.close();
+      socket = null;
+    },
+  };
 }

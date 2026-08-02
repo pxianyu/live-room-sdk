@@ -1,60 +1,26 @@
 import assert from 'node:assert/strict';
 
-import { LiveRoomSdkImpl } from '../../dist/LiveRoomSdk.js';
+import { createLiveRoomSdk } from '../../dist/index.js';
 
-if (process.env.OPEN_PLATFORM_RUN_BROWSER_HTTP_INTEGRATION !== '1') {
-  console.log('Skipped. Set OPEN_PLATFORM_RUN_BROWSER_HTTP_INTEGRATION=1 to run the HTTP integration test.');
+if (process.env.LIVE_ROOM_SDK_RUN_HTTP_INTEGRATION !== '1') {
+  console.log('Skipped. Set LIVE_ROOM_SDK_RUN_HTTP_INTEGRATION=1 to run the direct H5 HTTP check.');
   process.exit(0);
 }
 
-const apiBaseUrl = process.env.OPEN_PLATFORM_BROWSER_BASE_URL;
-const ticket = process.env.OPEN_PLATFORM_BROWSER_TICKET;
-const roomId = process.env.OPEN_PLATFORM_BROWSER_ROOM_ID;
-const origin = process.env.OPEN_PLATFORM_BROWSER_ORIGIN;
+const apiBaseUrl = process.env.LIVE_ROOM_API_BASE_URL;
+const accessToken = process.env.LIVE_ROOM_ACCESS_TOKEN;
+const uniacid = process.env.LIVE_ROOM_UNIACID;
+const liveId = process.env.LIVE_ROOM_ID;
 
-assert.ok(apiBaseUrl, 'OPEN_PLATFORM_BROWSER_BASE_URL is required.');
-assert.ok(ticket, 'OPEN_PLATFORM_BROWSER_TICKET is required.');
-assert.ok(roomId, 'OPEN_PLATFORM_BROWSER_ROOM_ID is required.');
-assert.ok(origin, 'OPEN_PLATFORM_BROWSER_ORIGIN is required.');
+assert.ok(apiBaseUrl, 'LIVE_ROOM_API_BASE_URL is required.');
+assert.ok(accessToken, 'LIVE_ROOM_ACCESS_TOKEN is required.');
+assert.ok(uniacid, 'LIVE_ROOM_UNIACID is required.');
+assert.ok(liveId, 'LIVE_ROOM_ID is required.');
 
-const sdk = new LiveRoomSdkImpl({
-  apiBaseUrl,
-  auth: {
-    type: 'ticket',
-    ticket
-  },
-  fetch: (input, init) => {
-    const headers = new Headers(init?.headers);
-    headers.set('Origin', origin);
+const sdk = createLiveRoomSdk({ apiBaseUrl, accessToken, uniacid, liveId });
+const response = await sdk.live.getInfo();
 
-    return fetch(input, {
-      ...init,
-      headers
-    });
-  }
-});
-const errors = [];
-sdk.room.on('error', (event) => errors.push(event.error));
+assert.equal(response.status, 200, 'Original H5 live detail request should succeed.');
+assert.ok(response.data.live, 'Original H5 live detail should contain live data.');
 
-try {
-  await sdk.connect();
-
-  assert.equal(sdk.room.id, roomId, 'Browser SDK should bootstrap the ticket room.');
-  assert.equal(
-    sdk.room.state,
-    'degraded',
-    'Browser SDK should retain the usable room session when the platform websocket is unavailable.'
-  );
-  assert.equal(
-    errors.length,
-    1,
-    `Platform websocket failure should emit one room error: ${JSON.stringify(
-      errors.map(({ code, message }) => ({ code, message }))
-    )}`
-  );
-  assert.equal(errors[0].code, 'WEBSOCKET_AUTH_FAILED');
-} finally {
-  await sdk.close();
-}
-
-console.log('Open platform browser SDK HTTP integration test passed.');
+console.log('Direct H5 HTTP integration test passed.');

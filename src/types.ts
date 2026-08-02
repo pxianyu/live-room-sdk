@@ -1,291 +1,109 @@
-export type RoomCapability =
-  | 'room:view'
-  | 'message:read'
-  | 'message:send'
-  | 'message:delete'
-  | 'user:mute'
-  | 'room:mute'
-  | 'metrics:read';
+export type LiveApiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
-export type RoomConnectionState =
-  | 'idle'
-  | 'authenticating'
-  | 'bootstrapping'
-  | 'connecting'
-  | 'synchronizing'
-  | 'ready'
-  | 'reconnecting'
-  | 'degraded'
-  | 'ended'
-  | 'closed'
-  | 'error';
+export interface LiveApiResponse<T = unknown> {
+  status: number;
+  data: T;
+  msg?: string;
+  message?: string;
+  [key: string]: unknown;
+}
 
-export interface LiveRoomLogger {
-  debug?(message: string, meta?: Record<string, unknown>): void;
-  info?(message: string, meta?: Record<string, unknown>): void;
-  warn?(message: string, meta?: Record<string, unknown>): void;
-  error?(message: string, meta?: Record<string, unknown>): void;
+export interface LiveApiRequest {
+  query?: Record<string, string | number | boolean | undefined>;
+  data?: unknown;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+}
+
+export interface LiveApiClient {
+  request<T = unknown>(method: LiveApiMethod, path: string, request?: LiveApiRequest): Promise<LiveApiResponse<T>>;
+  get<T = unknown>(path: string, query?: LiveApiRequest['query']): Promise<LiveApiResponse<T>>;
+  post<T = unknown>(path: string, data?: unknown): Promise<LiveApiResponse<T>>;
+  put<T = unknown>(path: string, data?: unknown): Promise<LiveApiResponse<T>>;
+  del<T = unknown>(path: string, data?: unknown): Promise<LiveApiResponse<T>>;
+  getAction<T = unknown>(path: string, query?: LiveApiRequest['query']): Promise<LiveApiResponse<T>>;
+  postAction<T = unknown>(path: string, data?: unknown): Promise<LiveApiResponse<T>>;
+}
+
+export interface GoEasyChatConfig {
+  type?: number;
+  host: string;
+  authorization: {
+    mode: 'otp';
+    client_key: string;
+    otp: string;
+  };
+}
+
+export interface LiveUser {
+  id: string | number;
+  nickname: string;
+  avatar?: string;
+  spid?: string | number;
+  city?: string;
+}
+
+export type GoEasyMessage = Record<string, unknown>;
+
+export interface GoEasyCallbacks {
+  onMessage?(message: GoEasyMessage): void;
+  onPresence?(event: unknown): void;
+  onError?(error: unknown): void;
+}
+
+export interface GoEasyConnection {
+  publish(message: GoEasyMessage): Promise<void>;
+  getOnlineUsers(): Promise<unknown>;
+  close(): Promise<void>;
+}
+
+export interface ViewingContext {
+  liveLogId?: number;
+  watchScene?: 'live' | 'playback';
+  materialId?: number;
+  fileId?: string;
+  randomUser?: unknown;
+}
+
+export interface ViewingCallbacks {
+  onOpen?(): void;
+  onClose?(event: CloseEvent): void;
+  onMessage?(message: unknown): void;
+  onError?(error: unknown): void;
+  onReconnecting?(attempt: number): void;
+}
+
+export interface ViewingConnection {
+  send(message: Record<string, unknown>): void;
+  close(): void;
 }
 
 export interface LiveRoomSdkOptions {
   apiBaseUrl: string;
-  auth:
-    | {
-        type: 'ticket';
-        ticket: string;
-      }
-    | {
-        type: 'platform-operator';
-        getAccessToken: () => string | Promise<string>;
-      };
-  roomId?: string;
+  accessToken: string;
+  uniacid: string | number;
+  liveId: string | number;
+  websocketUrl?: string;
   fetch?: typeof fetch;
-  logger?: LiveRoomLogger;
-}
-
-export interface LiveRoomUser {
-  readonly id: string;
-  readonly externalId: string | undefined;
-  readonly nickname: string;
-  readonly avatarUrl: string | undefined;
-  readonly role: 'viewer' | 'operator';
-  readonly capabilities: readonly RoomCapability[];
-}
-
-export interface MediaSource {
-  protocol: string;
-  url: string;
-  expiresAt: string | undefined;
-}
-
-export interface RoomPlayback {
-  mode: string | undefined;
-  sources: readonly MediaSource[];
-}
-
-export interface RoomSnapshot {
-  id: string;
-  title: string | undefined;
-  status: string | undefined;
-  likeCount: number | undefined;
-  muted: boolean | undefined;
-  notice: string | undefined;
-  features: Record<string, boolean> | undefined;
-  playback: RoomPlayback | undefined;
-}
-
-export interface RoomMessageAuthor {
-  id: string;
-  nickname: string;
-  avatarUrl: string | undefined;
-}
-
-export interface RoomMessageContent {
-  type: 'text';
-  text: string;
-}
-
-export interface RoomMessage {
-  messageId: string;
-  eventId: string | undefined;
-  clientRequestId: string | undefined;
-  sequence: number | undefined;
-  author: RoomMessageAuthor;
-  content: RoomMessageContent;
-  state: 'pending' | 'accepted' | 'committed' | 'rejected' | 'deleted';
-  createdAt: string;
-}
-
-export interface PendingMessage extends RoomMessage {}
-
-export interface MessagePage {
-  messages: readonly RoomMessage[];
-  nextCursor: string | undefined;
-  hasMore: boolean;
-}
-
-export type RoomEventName =
-  | 'state.changed'
-  | 'room.status.changed'
-  | 'online.changed'
-  | 'message.created'
-  | 'message.deleted'
-  | 'like.changed'
-  | 'user.muted'
-  | 'room.muted'
-  | 'notice.updated'
-  | 'error';
-
-export interface RoomStateChangedEvent {
-  previous: RoomConnectionState;
-  current: RoomConnectionState;
-}
-
-export interface RoomStatusChangedEvent {
-  room: RoomSnapshot;
-}
-
-export interface OnlineChangedEvent {
-  online: number | null;
-}
-
-export interface MessageCreatedEvent {
-  message: RoomMessage;
-}
-
-export interface MessageDeletedEvent {
-  messageId: string;
-  reason: string | undefined;
-}
-
-export interface LikeChangedEvent {
-  count: number | undefined;
-  total: number | null;
-  userId: string | undefined;
-}
-
-export interface UserMutedEvent {
-  userId: string;
-  muted: boolean;
-  reason: string | undefined;
-}
-
-export interface RoomMutedEvent {
-  enabled: boolean;
-}
-
-export interface NoticeUpdatedEvent {
-  notice: string;
-}
-
-export interface RoomErrorEvent {
-  error: Error;
-}
-
-export interface LiveRoomEventMap {
-  'state.changed': RoomStateChangedEvent;
-  'room.status.changed': RoomStatusChangedEvent;
-  'online.changed': OnlineChangedEvent;
-  'message.created': MessageCreatedEvent;
-  'message.deleted': MessageDeletedEvent;
-  'like.changed': LikeChangedEvent;
-  'user.muted': UserMutedEvent;
-  'room.muted': RoomMutedEvent;
-  'notice.updated': NoticeUpdatedEvent;
-  error: RoomErrorEvent;
-}
-
-export type RoomEventHandler<T extends RoomEventName> = (event: LiveRoomEventMap[T]) => void;
-
-export interface LiveRoom {
-  readonly id: string;
-  readonly state: RoomConnectionState;
-  readonly info: RoomSnapshot | null;
-  readonly messages: readonly RoomMessage[];
-  readonly online: number | null;
-
-  open(): Promise<void>;
-  refreshInfo(): Promise<RoomSnapshot>;
-  refreshMedia(): Promise<readonly MediaSource[]>;
-  loadPreviousMessages(cursor?: string): Promise<MessagePage>;
-
-  sendComment(text: string): Promise<PendingMessage>;
-  sendLike(count?: number): Promise<void>;
-
-  deleteComment(messageId: string, reason?: string): Promise<void>;
-  muteUser(userId: string): Promise<void>;
-  unmuteUser(userId: string): Promise<void>;
-  setRoomMute(enabled: boolean): Promise<void>;
-
-  on<T extends RoomEventName>(event: T, handler: RoomEventHandler<T>): () => void;
-
-  close(): Promise<void>;
+  webSocketFactory?: (url: string) => WebSocket;
 }
 
 export interface LiveRoomSdk {
-  readonly user: LiveRoomUser;
-  readonly room: LiveRoom;
-
-  connect(): Promise<void>;
-  refresh(): Promise<void>;
+  api: LiveApiClient;
+  live: {
+    getInfo(query?: LiveApiRequest['query']): Promise<LiveApiResponse<Record<string, unknown>>>;
+    getPublicInfo(query?: LiveApiRequest['query']): Promise<LiveApiResponse<Record<string, unknown>>>;
+    getIntoInfo<T = unknown>(): Promise<LiveApiResponse<T>>;
+    updateLeave<T = unknown>(id: string | number): Promise<LiveApiResponse<T>>;
+    getUserInfo<T = unknown>(): Promise<LiveApiResponse<T>>;
+    getComments<T = unknown>(query?: LiveApiRequest['query']): Promise<LiveApiResponse<T>>;
+    like<T = unknown>(query?: LiveApiRequest['query']): Promise<LiveApiResponse<T>>;
+    filterComment<T = unknown>(data: unknown): Promise<LiveApiResponse<T>>;
+    createComment<T = unknown>(data: unknown): Promise<LiveApiResponse<T>>;
+  };
+  realtime: {
+    connectGoEasy(config: GoEasyChatConfig, user: LiveUser, callbacks?: GoEasyCallbacks): Promise<GoEasyConnection>;
+    connectViewing(user: LiveUser, callbacks?: ViewingCallbacks, context?: ViewingContext): ViewingConnection;
+  };
   close(): Promise<void>;
-}
-
-export interface ApiEnvelope<T> {
-  status?: number;
-  data: T;
-  request_id: string | undefined;
-  error?: {
-    code?: string;
-    message?: string;
-    retryable?: boolean;
-  };
-}
-
-export interface SessionResponse {
-  session_id: string;
-  role: 'viewer' | 'operator';
-  access_token: string;
-  expires_at: string;
-}
-
-export interface BootstrapResponse {
-  server_time?: string;
-  user: {
-    id: string;
-    external_id?: string;
-    nickname: string;
-    avatar_url?: string;
-    role: 'viewer' | 'operator';
-    capabilities?: RoomCapability[];
-  };
-  room: {
-    id: string;
-    title?: string;
-    status?: string;
-    like_count?: number;
-    muted?: boolean;
-    notice?: string;
-    sequence?: number;
-    current_sequence?: number;
-    features?: Record<string, boolean>;
-    playback?: {
-      mode?: string;
-      sources?: Array<{
-        protocol: string;
-        url: string;
-        expires_at?: string;
-      }>;
-    };
-  };
-  realtime?: {
-    credential_url?: string;
-    ws_url?: string;
-  };
-}
-
-export interface RealtimeCredentialResponse {
-  goeasy: {
-    host: string;
-    client_key: string;
-    connect_id: string;
-    otp: string;
-    channel: string;
-    access_token: string;
-    expires_at?: string;
-  };
-  websocket?: {
-    url: string;
-    ticket: string;
-    expires_at?: string;
-  };
-}
-
-export interface RealtimeEnvelope {
-  event_id?: string;
-  event_type?: string;
-  room_id?: string;
-  sequence?: number;
-  occurred_at?: string;
-  data?: Record<string, unknown>;
 }

@@ -1,150 +1,45 @@
-import { LiveRoomSdkImpl } from '../../dist/LiveRoomSdk.js';
-import { createDefaultRuntime } from '../../dist/internal/runtime.js';
+import assert from 'node:assert/strict';
 
-const statusElement = document.querySelector('#status');
-const evidenceElement = document.querySelector('#evidence');
-const goEasyEvents = [];
-const websocketEvents = [];
-const sdkErrors = [];
+import { createLiveRoomSdk } from '../../dist/index.js';
 
-function assert(condition, message) {
-  if (!condition) {
-    throw new Error(message);
-  }
+if (process.env.LIVE_ROOM_SDK_RUN_REALTIME_INTEGRATION !== '1') {
+  console.log('Skipped. Set LIVE_ROOM_SDK_RUN_REALTIME_INTEGRATION=1 to run the direct H5 realtime check.');
+  process.exit(0);
 }
 
-function show(status, evidence) {
-  document.documentElement.dataset.status = status.toLowerCase();
-  statusElement.textContent = status;
-  evidenceElement.textContent = JSON.stringify(evidence, null, 2);
-}
+const apiBaseUrl = process.env.LIVE_ROOM_API_BASE_URL;
+const accessToken = process.env.LIVE_ROOM_ACCESS_TOKEN;
+const websocketUrl = process.env.LIVE_ROOM_WEBSOCKET_URL;
+const uniacid = process.env.LIVE_ROOM_UNIACID;
+const liveId = process.env.LIVE_ROOM_ID;
 
-async function waitFor(predicate, message, timeout = 20_000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    if (predicate()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(message);
-}
+assert.ok(apiBaseUrl, 'LIVE_ROOM_API_BASE_URL is required.');
+assert.ok(accessToken, 'LIVE_ROOM_ACCESS_TOKEN is required.');
+assert.ok(websocketUrl, 'LIVE_ROOM_WEBSOCKET_URL is required.');
+assert.ok(uniacid, 'LIVE_ROOM_UNIACID is required.');
+assert.ok(liveId, 'LIVE_ROOM_ID is required.');
 
-function parseMessage(content) {
-  if (typeof content === 'string') {
-    return JSON.parse(content);
-  }
-  return content;
-}
+const sdk = createLiveRoomSdk({ apiBaseUrl, accessToken, websocketUrl, uniacid, liveId });
+const liveInfo = await sdk.live.getInfo();
+assert.equal(liveInfo.status, 200, 'Original H5 live detail request should succeed.');
 
-const config = await fetch('./open-platform-realtime-config.json', { cache: 'no-store' }).then((response) => {
-  if (!response.ok) {
-    throw new Error(`Unable to load integration config (${response.status}).`);
-  }
-  return response.json();
-});
-const baseRuntime = createDefaultRuntime(undefined, {
-  warn(message) {
-    sdkErrors.push(message);
-  },
-  error(message) {
-    sdkErrors.push(message);
-  }
-});
-const realtimeCredentials = [];
-const wrappedInstances = new WeakSet();
-const runtime = {
-  ...baseRuntime,
-  async fetch(input, init) {
-    const response = await baseRuntime.fetch(input, init);
-    if (String(input).includes('realtime-credential')) {
-      realtimeCredentials.push(await response.clone().json());
-    }
-    return response;
-  },
-  async loadGoEasy() {
-    const module = await baseRuntime.loadGoEasy();
-    return {
-      getInstance(options) {
-        const instance = module.getInstance(options);
-        if (!wrappedInstances.has(instance)) {
-          wrappedInstances.add(instance);
-          const subscribe = instance.pubsub.subscribe.bind(instance.pubsub);
-          instance.pubsub.subscribe = (subscribeOptions) => subscribe({
-            ...subscribeOptions,
-            onMessage(message) {
-              goEasyEvents.push(parseMessage(message.content));
-              subscribeOptions.onMessage(message);
-            }
-          });
-        }
-        return instance;
-      }
-    };
-  },
-  createWebSocket(url) {
-    const socket = baseRuntime.createWebSocket(url);
-    socket.addEventListener('message', (event) => {
-      const payload = JSON.parse(String(event.data ?? '{}'));
-      websocketEvents.push(payload);
-    });
-    return socket;
-  }
-};
-const sdk = new LiveRoomSdkImpl({
-  apiBaseUrl: config.api_base_url,
-  auth: {
-    type: 'ticket',
-    ticket: config.ticket
-  }
-}, { runtime });
-sdk.room.on('error', ({ error }) => {
-  sdkErrors.push(`${error.code ?? 'ERROR'}: ${error.message}`);
-});
+const user = liveInfo.data.userInfo;
+const chatConfig = liveInfo.data.chatConfig;
+assert.ok(user?.id && user?.nickname, 'Original H5 live detail should contain userInfo.');
+assert.equal(chatConfig?.authorization?.mode, 'otp', 'Original H5 live detail should use GoEasy OTP authorization.');
+assert.ok(
+  chatConfig?.host && chatConfig.authorization.client_key && chatConfig.authorization.otp,
+  'Original H5 live detail should contain the GoEasy Client Key and one-time OTP.',
+);
 
-try {
-  await sdk.connect();
-  assert(sdk.room.state === 'ready', `Expected ready state, got ${sdk.room.state}.`);
-  assert(sdk.room.id === config.room_public_id, 'The SDK connected to an unexpected room.');
-  assert(websocketEvents.some((event) => event.type === 'room.ready'), 'WebSocket room.ready was not received.');
+let opened = false;
+const viewing = sdk.realtime.connectViewing(user, { onOpen: () => { opened = true; } });
+const chat = await sdk.realtime.connectGoEasy(chatConfig, user);
 
-  const pending = await sdk.room.sendComment(config.comment);
-  await waitFor(
-    () => goEasyEvents.some((event) => (
-      event.event_type === 'chat.message.created.v1'
-        && event.data?.content?.text === config.comment
-    )),
-    'The GoEasy subscriber did not receive the browser comment.'
-  );
-  await waitFor(
-    () => pending.state === 'committed',
-    'The SDK did not reconcile the pending comment.'
-  );
-  await waitFor(
-    () => websocketEvents.some((event) => event.type === 'room.heartbeat.ack'),
-    'WebSocket heartbeat acknowledgement was not received.',
-    25_000
-  );
+await new Promise((resolve) => setTimeout(resolve, 1500));
+assert.equal(opened, true, 'Original ws1 viewing connection should open.');
 
-  await sdk.close();
-  assert(sdk.room.state === 'closed', 'The SDK did not close its realtime resources.');
-  show('PASSED', {
-    room_id: config.room_public_id,
-    final_state: sdk.room.state,
-    goeasy_event_types: goEasyEvents.map((event) => event.event_type),
-    websocket_event_types: websocketEvents.map((event) => event.type),
-    websocket_url: realtimeCredentials.at(-1)?.data?.websocket?.url ?? null,
-    online: sdk.room.online,
-    errors: sdkErrors
-  });
-} catch (error) {
-  await sdk.close().catch(() => undefined);
-  show('FAILED', {
-    message: error instanceof Error ? error.message : String(error),
-    sdk_state: sdk.room.state,
-    goeasy_event_types: goEasyEvents.map((event) => event.event_type),
-    websocket_event_types: websocketEvents.map((event) => event.type),
-    websocket_url: realtimeCredentials.at(-1)?.data?.websocket?.url ?? null,
-    errors: sdkErrors
-  });
-}
+await chat.close();
+viewing.close();
+await sdk.close();
+console.log('Direct H5 realtime integration test passed.');

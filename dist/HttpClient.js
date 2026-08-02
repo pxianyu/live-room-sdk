@@ -1,117 +1,66 @@
-import { LiveRoomSdkError, isLiveRoomSdkError } from './errors.js';
-function joinUrl(baseUrl, path, query) {
-    const absoluteBaseUrl = /^[a-z][a-z\d+.-]*:\/\//i.test(baseUrl);
-    const normalizedBaseUrl = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-    const url = new URL(path.replace(/^\//, ''), absoluteBaseUrl ? normalizedBaseUrl : new URL(normalizedBaseUrl || '/', 'http://live-room-sdk.local').toString());
-    if (query) {
-        for (const [key, value] of Object.entries(query)) {
-            if (value !== undefined) {
-                url.searchParams.set(key, String(value));
-            }
+function buildUrl(baseUrl, path, query) {
+    const absolute = /^[a-z][a-z\d+.-]*:\/\//i.test(baseUrl);
+    const origin = typeof globalThis.location?.origin === 'string' ? globalThis.location.origin : 'http://live-room-sdk.local';
+    const url = new URL(`${baseUrl.replace(/\/$/, '')}/${path.replace(/^\/+/, '')}`, origin);
+    for (const [key, value] of Object.entries(query ?? {})) {
+        if (value !== undefined) {
+            url.searchParams.set(key, String(value));
         }
     }
-    return absoluteBaseUrl ? url.toString() : `${url.pathname}${url.search}`;
+    return absolute ? url.toString() : `${url.pathname}${url.search}`;
 }
-function inferErrorCode(status, fallback) {
-    switch (fallback) {
-        case 'INVALID_TICKET':
-        case 'SESSION_EXPIRED':
-        case 'ORIGIN_DENIED':
-        case 'ROOM_NOT_ACCESSIBLE':
-        case 'CAPABILITY_DENIED':
-        case 'USER_MUTED':
-        case 'RATE_LIMITED':
-        case 'GOEASY_CONNECT_FAILED':
-        case 'GOEASY_SUBSCRIBE_FAILED':
-        case 'WEBSOCKET_AUTH_FAILED':
-        case 'NETWORK_ERROR':
-        case 'SDK_CLOSED':
-        case 'INVALID_RESPONSE':
-        case 'AUTHENTICATION_REQUIRED':
-        case 'VALIDATION_FAILED':
-        case 'CONFLICT':
-        case 'RESOURCE_NOT_FOUND':
-        case 'INVALID_REQUEST':
-        case 'BODY_TOO_LARGE':
-        case 'INTERNAL_ERROR':
-            return fallback;
-        default:
-            return status === 401 ? 'SESSION_EXPIRED' : 'NETWORK_ERROR';
-    }
+function actionPath(path, liveId) {
+    return `${path.replace(/\/$/, '')}/${liveId}`;
 }
-export class HttpClient {
-    options;
-    constructor(options) {
-        this.options = options;
-    }
-    async request(request) {
-        return this.execute(request, false);
-    }
-    async execute(request, retried) {
+function isFormPayload(data) {
+    return ((typeof FormData !== 'undefined' && data instanceof FormData)
+        || (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams));
+}
+export function createLiveApi(options) {
+    const request = async (method, path, input = {}) => {
+        const requestFetch = options.fetch ?? globalThis.fetch;
+        if (!requestFetch) {
+            throw new Error('当前运行环境未提供 fetch');
+        }
+        const headers = {
+            Accept: 'application/json',
+            'Authori-zation': `Bearer ${options.accessToken}`,
+            ...input.headers,
+        };
+        const init = { method, headers };
+        if (input.signal) {
+            init.signal = input.signal;
+        }
+        if (input.data !== undefined) {
+            init.body = isFormPayload(input.data) ? input.data : JSON.stringify(input.data);
+            if (!isFormPayload(input.data)) {
+                headers['Content-Type'] = 'application/json';
+            }
+        }
+        const response = await requestFetch(buildUrl(options.baseUrl, path, input.query), init);
+        const text = await response.text();
+        let data;
         try {
-            const init = {
-                method: request.method,
-                headers: {
-                    Accept: 'application/json',
-                    ...(request.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-                    ...(request.accessToken ? { Authorization: `Bearer ${request.accessToken}` } : {})
-                }
-            };
-            if (request.body !== undefined) {
-                init.body = JSON.stringify(request.body);
-            }
-            const signal = request.signal === undefined ? this.options.signal : request.signal;
-            if (signal) {
-                init.signal = signal;
-            }
-            const response = await this.options.fetch(joinUrl(this.options.baseUrl, request.path, request.query), init);
-            const text = await response.text();
-            let envelope;
-            try {
-                envelope = JSON.parse(text);
-            }
-            catch {
-                throw new LiveRoomSdkError({
-                    code: 'INVALID_RESPONSE',
-                    message: `Expected JSON response but received: ${text.slice(0, 120)}`,
-                    status: response.status
-                });
-            }
-            if (response.status === 401 && request.retryOnUnauthorized !== false && !retried && this.options.onUnauthorized) {
-                const nextToken = await this.options.onUnauthorized();
-                if (nextToken) {
-                    return this.execute({
-                        ...request,
-                        accessToken: nextToken
-                    }, true);
-                }
-            }
-            if (!response.ok || envelope.error) {
-                throw new LiveRoomSdkError({
-                    code: inferErrorCode(response.status, envelope.error?.code),
-                    message: envelope.error?.message ?? response.statusText,
-                    requestId: envelope.request_id,
-                    retryable: envelope.error?.retryable ?? response.status >= 500,
-                    status: response.status,
-                    businessCode: typeof envelope.status === 'number' ? envelope.status : undefined
-                });
-            }
-            return {
-                data: envelope.data,
-                requestId: envelope.request_id
-            };
+            data = JSON.parse(text);
         }
-        catch (error) {
-            if (isLiveRoomSdkError(error)) {
-                throw error;
-            }
-            throw new LiveRoomSdkError({
-                code: 'NETWORK_ERROR',
-                message: error instanceof Error ? error.message : 'Network request failed.',
-                retryable: true,
-                cause: error
-            });
+        catch {
+            throw new Error(`直播接口未返回 JSON：${text.slice(0, 120)}`);
         }
-    }
+        if (!response.ok) {
+            throw new Error(data.message ?? data.msg ?? `直播接口请求失败 (${response.status})`);
+        }
+        return data;
+    };
+    return {
+        request,
+        get: (path, query) => query ? request('GET', path, { query }) : request('GET', path),
+        post: (path, data) => request('POST', path, { data }),
+        put: (path, data) => request('PUT', path, { data }),
+        del: (path, data) => request('DELETE', path, { data }),
+        getAction: (path, query) => query
+            ? request('GET', actionPath(path, options.liveId), { query })
+            : request('GET', actionPath(path, options.liveId)),
+        postAction: (path, data) => request('POST', actionPath(path, options.liveId), { data }),
+    };
 }
 //# sourceMappingURL=HttpClient.js.map
